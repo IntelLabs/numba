@@ -195,6 +195,7 @@ class CPUTargetOptions(TargetOptions):
         "no_rewrites": bool,
         "no_cpython_wrapper": bool,
         "fastmath": bool,
+        "parallel": bool,
     }
 
 
