@@ -223,7 +223,7 @@ class ParallelGUFuncBuilder(ufuncbuilder.GUFuncBuilder):
         _init()
 
         # Build wrapper for ufunc entry point
-        ptr, env = build_gufunc_wrapper(self.py_func, cres, self.sin, self.sout,
+        ptr, env, wrapper_name = build_gufunc_wrapper(self.py_func, cres, self.sin, self.sout,
                                         cache=self.cache)
 
         # Get dtypes
