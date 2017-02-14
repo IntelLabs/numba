@@ -242,7 +242,7 @@ def build_gufunc_wrapper(py_func, cres, sin, sout, cache):
     library = cres.library
     ctx = cres.target_context
     signature = cres.signature
-    innerfunc, env = ufuncbuilder.build_gufunc_wrapper(py_func, cres, sin, sout,
+    innerfunc, env, wrapper_name = ufuncbuilder.build_gufunc_wrapper(py_func, cres, sin, sout,
                                                        cache=cache)
     sym_in = set(sym for term in sin for sym in term)
     sym_out = set(sym for term in sout for sym in term)
@@ -250,7 +250,7 @@ def build_gufunc_wrapper(py_func, cres, sin, sout, cache):
 
     ptr = build_gufunc_kernel(library, ctx, innerfunc, signature, inner_ndim)
 
-    return ptr, env
+    return ptr, env, wrapper_name
 
 
 def build_gufunc_kernel(library, ctx, innerfunc, sig, inner_ndim):
