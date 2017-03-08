@@ -248,9 +248,9 @@ def build_gufunc_wrapper(py_func, cres, sin, sout, cache):
     sym_out = set(sym for term in sout for sym in term)
     inner_ndim = len(sym_in | sym_out)
 
-    ptr = build_gufunc_kernel(library, ctx, innerfunc, signature, inner_ndim)
+    ptr, name = build_gufunc_kernel(library, ctx, innerfunc, signature, inner_ndim)
 
-    return ptr, env, wrapper_name
+    return ptr, env, name
 
 
 def build_gufunc_kernel(library, ctx, innerfunc, sig, inner_ndim):
@@ -383,7 +383,7 @@ def build_gufunc_kernel(library, ctx, innerfunc, sig, inner_ndim):
 
     wrapperlib.add_ir_module(mod)
     wrapperlib.add_linking_library(library)
-    return wrapperlib.get_pointer_to_function(lfunc.name)
+    return wrapperlib.get_pointer_to_function(lfunc.name), lfunc.name
 
 
 # ---------------------------------------------------------------------------
