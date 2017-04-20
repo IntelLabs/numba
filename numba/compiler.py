@@ -17,6 +17,7 @@ from numba import (bytecode, interpreter, funcdesc, postproc,
 from numba.targets import cpu, callconv
 from numba.annotations import type_annotations
 from numba.parfor import ParforPass
+from numba.pio import PIO
 
 
 # Lock for the preventing multiple compiler execution
@@ -492,6 +493,15 @@ class Pipeline(object):
             self.type_annotation.calltypes, self.return_type)
         parfor_pass.run()
 
+    def stage_io_pass(self):
+        """
+        Convert IO calls
+        """
+        # Ensure we have an IR and type information.
+        assert self.func_ir
+        io_pass = PIO(self.func_ir)
+        io_pass.run()
+
     def stage_annotate_type(self):
         """
         Create type annotation after type inference
@@ -638,6 +648,8 @@ class Pipeline(object):
                 if self.status.can_fallback:
                     pm.add_stage(self.stage_preserve_ir, "preserve IR for fallback")
                 pm.add_stage(self.stage_generic_rewrites, "nopython rewrites")
+            if self.flags.auto_parallel:
+                pm.add_stage(self.stage_io_pass, "replace IO calls")
             pm.add_stage(self.stage_nopython_frontend, "nopython frontend")
             pm.add_stage(self.stage_annotate_type, "annotate type")
             if not self.flags.no_rewrites:
