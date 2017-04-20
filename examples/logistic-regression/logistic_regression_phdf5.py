@@ -4,11 +4,11 @@ import h5py
 import argparse
 import time
 
-@numba.njit(parallel=True)
+@numba.njit(parallel=True, locals={'X':numba.float64[:,:], 'Y':numba.float64[:]})
 def logistic_regression(file_name, iterations):
     f = h5py.File(file_name, "r")
-    X = f['points'].value.astype(np.float64)
-    Y = f['responses'].value.astype(np.float64)
+    X = f['points'][:]
+    Y = f['responses'][:]
     D = X.shape[1]
     w = 2.0*np.ones(D)-1.3
     for i in range(iterations):
@@ -23,7 +23,7 @@ def main():
 
     file_name = args.file
     iterations = args.iterations
-    
+
     t = time.time()
     w = logistic_regression(file_name, iterations)
     selftimed = time.time()-t
