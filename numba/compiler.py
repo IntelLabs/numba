@@ -18,7 +18,7 @@ from numba.targets import cpu, callconv
 from numba.annotations import type_annotations
 from numba.parfor import ParforPass
 from numba.inline_closurecall import InlineClosureCallPass
-
+from numba.pio import PIO
 
 # Lock for the preventing multiple compiler execution
 lock_compiler = threading.RLock()
@@ -510,6 +510,14 @@ class Pipeline(object):
             print(("IR DUMP: %s" % name).center(80, "-"))
             self.func_ir.dump()
 
+    def stage_io_pass(self):
+        """
+        Convert IO calls
+        """
+        # Ensure we have an IR and type information.
+        assert self.func_ir
+        io_pass = PIO(self.func_ir)
+        io_pass.run()
 
     def stage_annotate_type(self):
         """
@@ -658,6 +666,8 @@ class Pipeline(object):
                     pm.add_stage(self.stage_preserve_ir, "preserve IR for fallback")
                 pm.add_stage(self.stage_generic_rewrites, "nopython rewrites")
             pm.add_stage(self.stage_inline_pass, "inline calls to locally defined closures")
+            if self.flags.auto_parallel:
+                pm.add_stage(self.stage_io_pass, "replace IO calls")
             pm.add_stage(self.stage_nopython_frontend, "nopython frontend")
             pm.add_stage(self.stage_annotate_type, "annotate type")
             if not self.flags.no_rewrites:
