@@ -66,20 +66,22 @@ from numba.typing import signature
 @infer_global(h5py.File)
 class H5File(AbstractTemplate):
     def generic(self, args, kws):
-        #pdb.set_trace()
         assert not kws
-        #assert len(args)==2
+        assert len(args)==2
         return signature(types.int32, *args)
 
 from llvmlite import ir as lir
 
-@lower_builtin(h5py.File, types.string, types.string)
-@lower_builtin(h5py.File, types.string, types.Const)
-@lower_builtin(h5py.File, types.Const, types.string)
+#@lower_builtin(h5py.File, types.string, types.string)
+#@lower_builtin(h5py.File, types.string, types.Const)
+#@lower_builtin(h5py.File, types.Const, types.string)
 @lower_builtin(h5py.File, types.Const, types.Const)
-@lower_builtin(h5py.File)
 def h5_open(context, builder, sig, args):
-    #pdb.set_trace()
-    fnty = lir.FunctionType(lir.IntType(32), [])
+    # works for constant strings only
+    # TODO: extend to string variables
+    arg1, arg2 = sig.args
+    val1 = context.insert_const_string(builder.module, arg1.value)
+    val2 = context.insert_const_string(builder.module, arg2.value)
+    fnty = lir.FunctionType(lir.IntType(32), [lir.IntType(8).as_pointer(), lir.IntType(8).as_pointer()])
     fn = builder.module.get_or_insert_function(fnty, name="numba_h5_open")
-    return builder.call(fn, ())
+    return builder.call(fn, [val1, val2])
