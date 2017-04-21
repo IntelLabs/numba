@@ -112,6 +112,7 @@ def get_ext_modules():
                                        "numba/_math_c99.h",
                                        "numba/_helperlib.c",
                                        "numba/_lapack.c",
+                                       "numba/_io.c",
                                        "numba/_npymath_exports.c",
                                        "numba/_random.c",
                                        "numba/mathnames.inc"],
