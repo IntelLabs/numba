@@ -46,6 +46,7 @@ class PIO(object):
             if rhs.op=='getattr' and rhs.value.name in self.h5_globals and rhs.attr=='File':
                 self.h5_file_calls.append(lhs)
                 # TODO: return file open call
+                #return ir.Expr()
                 #return None
             if rhs.op=='call' and rhs.func.name in self.h5_file_calls:
                 self.h5_files.append(lhs)
@@ -59,7 +60,26 @@ class PIO(object):
             self.h5_files.append(lhs)
         return assign
 
-@lower_builtin('h5_open', types.string, types.string)
+from numba.typing.templates import infer_global, AbstractTemplate
+from numba.typing import signature
+
+@infer_global(h5py.File)
+class H5File(AbstractTemplate):
+    def generic(self, args, kws):
+        #pdb.set_trace()
+        assert not kws
+        #assert len(args)==2
+        return signature(types.int32, *args)
+
+from llvmlite import ir as lir
+
+@lower_builtin(h5py.File, types.string, types.string)
+@lower_builtin(h5py.File, types.string, types.Const)
+@lower_builtin(h5py.File, types.Const, types.string)
+@lower_builtin(h5py.File, types.Const, types.Const)
+@lower_builtin(h5py.File)
 def h5_open(context, builder, sig, args):
     #pdb.set_trace()
-    return 3
+    fnty = lir.FunctionType(lir.IntType(32), [])
+    fn = builder.module.get_or_insert_function(fnty, name="numba_h5_open")
+    return builder.call(fn, ())
