@@ -4,7 +4,7 @@ import types as pytypes # avoid confusion with numba.types
 import numba
 from numba import ir, analysis, types, config, numpy_support
 from numba.ir_utils import (mk_unique_var, replace_vars_inner, find_topo_order,
-                            dprint_func_ir, remove_dead)
+                            dprint_func_ir, remove_dead, mk_alloc)
 
 from numba.targets.imputils import lower_builtin
 import numpy as np
@@ -66,7 +66,7 @@ class PIO(object):
                 self.h5_dsets[lhs] = (rhs.value, rhs.index_var)
             # x = f['dset'][:]
             if rhs.op=='static_getitem' and rhs.value.name in self.h5_dsets:
-                return self._gen_h5read(lhs, rhs)
+                return self._gen_h5read(assign.target, rhs)
         # handle copies lhs = f
         if isinstance(rhs, ir.Var) and rhs.name in self.h5_files:
             self.h5_files[lhs] = self.h5_files[rhs.name]
@@ -74,18 +74,17 @@ class PIO(object):
             self.str_const_table[lhs] = rhs.value
         return [assign]
 
-    def _gen_h5read(self, lhs, rhs):
+    def _gen_h5read(self, lhs_var, rhs):
         f_id, dset  = self.h5_dsets[rhs.value.name]
         file_name = self.h5_files[f_id.name]
         dset_str = self.str_const_table[dset.name]
-        dset_type = self._get_dset_type(lhs, file_name, dset_str)
+        dset_type = self._get_dset_type(lhs_var.name, file_name, dset_str)
         loc = rhs.value.loc
         scope = rhs.value.scope
         # TODO: generate size, alloc calls
         out = []
         size_vars = self._gen_h5size(f_id, dset, dset_type.ndim, scope, loc, out)
-        # dummy:
-        out.append(ir.Assign(size_vars[0], ir.Var(scope,lhs,loc), loc))
+        out.extend(mk_alloc(None, None, lhs_var, tuple(size_vars), dset_type.dtype, scope, loc))
         return out
 
 
