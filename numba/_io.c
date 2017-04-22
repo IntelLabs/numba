@@ -18,7 +18,7 @@ numba_h5_open(char* file_name, char* mode)
 }
 
 NUMBA_EXPORT_FUNC(int64_t)
-numba_h5_size(hid_t file_id, char* dset_name)
+numba_h5_size(hid_t file_id, char* dset_name, int dim)
 {
     hid_t dataset_id;
     dataset_id = H5Dopen2(file_id, dset_name, H5P_DEFAULT);
@@ -28,5 +28,5 @@ numba_h5_size(hid_t file_id, char* dset_name)
     hsize_t data_ndim = H5Sget_simple_extent_ndims(space_id);
     hsize_t space_dims[data_ndim];
     H5Sget_simple_extent_dims(space_id, space_dims, NULL);
-    return space_dims[0];
+    return space_dims[dim];
 }

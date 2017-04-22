@@ -7,7 +7,7 @@ from numba.ir_utils import (mk_unique_var, replace_vars_inner, find_topo_order,
                             dprint_func_ir, remove_dead)
 
 from numba.targets.imputils import lower_builtin
-
+import numpy as np
 
 import h5py
 
@@ -101,8 +101,11 @@ class PIO(object):
         out += [g_pio_assign, attr_assign]
 
         for i in range(ndims):
+            dim_var = ir.Var(scope, mk_unique_var("$h5_dim_var"), loc)
+            dim_assign = ir.Assign(ir.Const(np.int32(i), loc), dim_var, loc)
+            out.append(dim_assign)
             size_var = ir.Var(scope, mk_unique_var("$h5_size_var"), loc)
-            size_call = ir.Expr.call(attr_var, [f_id, dset], (), loc)
+            size_call = ir.Expr.call(attr_var, [f_id, dset, dim_var], (), loc)
             size_assign = ir.Assign(size_call, size_var, loc)
             out.append(size_assign)
         return [size_var]
@@ -144,7 +147,7 @@ class H5File(AbstractTemplate):
 class H5Size(AbstractTemplate):
     def generic(self, args, kws):
         assert not kws
-        assert len(args)==2
+        assert len(args)==3
         return signature(types.int64, *args)
 
 from llvmlite import ir as lir
@@ -163,12 +166,12 @@ def h5_open(context, builder, sig, args):
     fn = builder.module.get_or_insert_function(fnty, name="numba_h5_open")
     return builder.call(fn, [val1, val2])
 
-@lower_builtin(h5size, types.int32, types.Const)
+@lower_builtin(h5size, types.int32, types.Const, types.int32)
 def h5_size(context, builder, sig, args):
     # works for constant string only
     # TODO: extend to string variables
-    arg1, arg2 = sig.args
+    arg1, arg2, args3 = sig.args
     val2 = context.insert_const_string(builder.module, arg2.value)
-    fnty = lir.FunctionType(lir.IntType(64), [lir.IntType(32), lir.IntType(8).as_pointer()])
+    fnty = lir.FunctionType(lir.IntType(64), [lir.IntType(32), lir.IntType(8).as_pointer(), lir.IntType(32)])
     fn = builder.module.get_or_insert_function(fnty, name="numba_h5_size")
-    return builder.call(fn, [args[0], val2])
+    return builder.call(fn, [args[0], val2, args[2]])
