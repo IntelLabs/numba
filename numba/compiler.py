@@ -499,7 +499,7 @@ class Pipeline(object):
         """
         # Ensure we have an IR and type information.
         assert self.func_ir
-        io_pass = PIO(self.func_ir)
+        io_pass = PIO(self.func_ir, self.locals)
         io_pass.run()
 
     def stage_annotate_type(self):
