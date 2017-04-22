@@ -2,11 +2,12 @@ from __future__ import print_function, division, absolute_import
 import types as pytypes # avoid confusion with numba.types
 
 import numba
-from numba import ir, analysis, types, config
+from numba import ir, analysis, types, config, numpy_support
 from numba.ir_utils import (mk_unique_var, replace_vars_inner, find_topo_order,
                             dprint_func_ir, remove_dead)
 
 from numba.targets.imputils import lower_builtin
+
 
 import h5py
 
@@ -21,12 +22,16 @@ class PIO(object):
         self.h5_dsets = {}
         # varname -> 'str'
         self.str_const_table = {}
+        self.reverse_copies = {}
 
     def run(self):
         dprint_func_ir(self.func_ir, "starting IO")
         topo_order = find_topo_order(self.func_ir.blocks)
         for label in topo_order:
             new_body = []
+            # copies are collected before running the pass since
+            # variables typed in locals are assigned late
+            self._get_reverse_copies(self.func_ir.blocks[label].body)
             for inst in self.func_ir.blocks[label].body:
                 if isinstance(inst, ir.Assign):
                     inst_list = self._run_assign(inst)
@@ -73,14 +78,12 @@ class PIO(object):
         f_id, dset  = self.h5_dsets[rhs.value.name]
         file_name = self.h5_files[f_id.name]
         dset_str = self.str_const_table[dset.name]
-        get_dset_type = self._get_dset_type(file_name, dset_str)
+        dset_type = self._get_dset_type(lhs, file_name, dset_str)
         loc = rhs.value.loc
         scope = rhs.value.scope
-
-        ndims = 1
         # TODO: generate size, alloc calls
         out = []
-        size_vars = self._gen_h5size(f_id, dset, ndims, scope, loc, out)
+        size_vars = self._gen_h5size(f_id, dset, dset_type.ndim, scope, loc, out)
         # dummy:
         out.append(ir.Assign(size_vars[0], ir.Var(scope,lhs,loc), loc))
         return out
@@ -104,8 +107,24 @@ class PIO(object):
             out.append(size_assign)
         return [size_var]
 
-    def _get_dset_type(self, file_name, dset_str):
-        pass
+    def _get_dset_type(self, lhs, file_name, dset_str):
+        """get data set type from user-specified locals types or actual file"""
+        if lhs in self.local_vars:
+            return self.local_vars[lhs]
+        if self.reverse_copies[lhs] in self.local_vars:
+            return self.local_vars[self.reverse_copies[lhs]]
+
+        f = h5py.File(file_name, "r")
+        ndims = len(f[dset_str].shape)
+        numba_dtype = numpy_support.from_dtype(f[dset_str].dtype)
+        return types.Array(numba_dtype, ndims, 'C')
+
+    def _get_reverse_copies(self, body):
+        for inst in body:
+            if isinstance(inst, ir.Assign) and isinstance(inst.value, ir.Var):
+                self.reverse_copies[inst.value.name] = inst.target.name
+        return
+
 
 from numba.typing.templates import infer_global, AbstractTemplate
 from numba.typing import signature
