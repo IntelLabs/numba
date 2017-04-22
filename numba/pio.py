@@ -3,12 +3,11 @@ import types as pytypes # avoid confusion with numba.types
 
 from numba import ir, analysis, types, config
 from numba.ir_utils import (mk_unique_var, replace_vars_inner, find_topo_order,
-                            dprint_func_ir)
+                            dprint_func_ir, remove_dead)
 
 from numba.targets.imputils import lower_builtin
 
 import h5py
-import pdb
 
 class PIO(object):
     """analyze and transform hdf5 calls"""
@@ -17,7 +16,7 @@ class PIO(object):
         self.h5_globals = []
         self.h5_file_calls = []
         self.h5_files = []
-        self.h5_dsets = []
+        self.h5_dsets = {}
 
     def run(self):
         dprint_func_ir(self.func_ir, "starting IO")
@@ -26,10 +25,13 @@ class PIO(object):
             new_body = []
             for inst in self.func_ir.blocks[label].body:
                 if isinstance(inst, ir.Assign):
-                    inst = self._run_assign(inst)
-                if inst is not None:
+                    inst_list = self._run_assign(inst)
+                    if inst_list is not None:
+                        new_body.extend(inst_list)
+                else:
                     new_body.append(inst)
             self.func_ir.blocks[label].body = new_body
+        remove_dead(self.func_ir.blocks, self.func_ir.arg_names)
         dprint_func_ir(self.func_ir, "after IO")
         if config.DEBUG_ARRAY_OPT==1:
             print("h5 files: ", self.h5_files)
@@ -51,17 +53,35 @@ class PIO(object):
             if rhs.op=='call' and rhs.func.name in self.h5_file_calls:
                 self.h5_files.append(lhs)
             if rhs.op=='static_getitem' and rhs.value.name in self.h5_files:
-                self.h5_dsets.append(lhs)
+                self.h5_dsets[lhs] = (rhs.value, rhs.index_var)
             if rhs.op=='static_getitem' and rhs.value.name in self.h5_dsets:
-                print("data: ", lhs)
-                # TODO: read call
+                f_id, dset  = self.h5_dsets[rhs.value.name]
+                loc = rhs.value.loc
+                scope = rhs.value.scope
+                # TODO: generate size, alloc calls
+                # g_pio_var = Global(numba.pio)
+                g_pio_var = ir.Var(scope, mk_unique_var("$np_g_var"), loc)
+                g_pio = ir.Global('pio', numba.pio, loc)
+                g_pio_assign = ir.Assign(g_pio, g_pio_var, loc)
+                # attr call: h5size_attr = getattr(g_pio_var, h5size)
+                h5size_attr_call = ir.Expr.getattr(g_pio_var, "h5size", loc)
+                attr_var = ir.Var(scope, mk_unique_var("$h5size_attr"), loc)
+                attr_assign = ir.Assign(h5size_attr_call, attr_var, loc)
+
+                #assign.value = ir.Expr.getattr(numba.pio, 'h5_read', rhs.loc)
+                assign.value = ir.Expr.call(attr_var, [f_id, dset], (), rhs.loc)
+                return [g_pio_assign, attr_assign, assign]
         # handle copies lhs = rhs
         if isinstance(rhs, ir.Var) and rhs.name in self.h5_files:
             self.h5_files.append(lhs)
-        return assign
+        return [assign]
 
 from numba.typing.templates import infer_global, AbstractTemplate
 from numba.typing import signature
+
+def h5size():
+    """dummy function for C h5_size"""
+    pass
 
 @infer_global(h5py.File)
 class H5File(AbstractTemplate):
@@ -69,6 +89,13 @@ class H5File(AbstractTemplate):
         assert not kws
         assert len(args)==2
         return signature(types.int32, *args)
+
+@infer_global(h5size)
+class H5Size(AbstractTemplate):
+    def generic(self, args, kws):
+        assert not kws
+        assert len(args)==2
+        return signature(types.int64, *args)
 
 from llvmlite import ir as lir
 
@@ -85,3 +112,13 @@ def h5_open(context, builder, sig, args):
     fnty = lir.FunctionType(lir.IntType(32), [lir.IntType(8).as_pointer(), lir.IntType(8).as_pointer()])
     fn = builder.module.get_or_insert_function(fnty, name="numba_h5_open")
     return builder.call(fn, [val1, val2])
+
+@lower_builtin(h5size, types.int32, types.Const)
+def h5_size(context, builder, sig, args):
+    # works for constant string only
+    # TODO: extend to string variables
+    arg1, arg2 = sig.args
+    val2 = context.insert_const_string(builder.module, arg2.value)
+    fnty = lir.FunctionType(lir.IntType(64), [lir.IntType(32), lir.IntType(8).as_pointer()])
+    fn = builder.module.get_or_insert_function(fnty, name="numba_h5_size")
+    return builder.call(fn, [args[0], val2])

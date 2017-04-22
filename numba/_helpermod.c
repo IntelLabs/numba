@@ -103,6 +103,7 @@ build_c_helpers_dict(void)
     declmethod(xgesv);
     declmethod(xxnrm2);
     declmethod(h5_open);
+    declmethod(h5_size);
 
     /* PRNG support */
     declmethod(get_py_random_state);
