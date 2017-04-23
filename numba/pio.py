@@ -2,11 +2,12 @@ from __future__ import print_function, division, absolute_import
 import types as pytypes # avoid confusion with numba.types
 
 import numba
-from numba import ir, analysis, types, config, numpy_support
+from numba import ir, analysis, types, config, numpy_support, cgutils
 from numba.ir_utils import (mk_unique_var, replace_vars_inner, find_topo_order,
                             dprint_func_ir, remove_dead, mk_alloc)
 
 from numba.targets.imputils import lower_builtin
+from numba.targets.arrayobj import make_array
 import numpy as np
 
 import h5py
@@ -85,8 +86,8 @@ class PIO(object):
         out = []
         size_vars = self._gen_h5size(f_id, dset, dset_type.ndim, scope, loc, out)
         out.extend(mk_alloc(None, None, lhs_var, tuple(size_vars), dset_type.dtype, scope, loc))
+        self._gen_h5read_call(f_id, dset, size_vars, lhs_var, scope, loc, out)
         return out
-
 
     def _gen_h5size(self, f_id, dset, ndims, scope, loc, out):
         # g_pio_var = Global(numba.pio)
@@ -99,15 +100,41 @@ class PIO(object):
         attr_assign = ir.Assign(h5size_attr_call, attr_var, loc)
         out += [g_pio_assign, attr_assign]
 
+        size_vars = []
         for i in range(ndims):
             dim_var = ir.Var(scope, mk_unique_var("$h5_dim_var"), loc)
             dim_assign = ir.Assign(ir.Const(np.int32(i), loc), dim_var, loc)
             out.append(dim_assign)
             size_var = ir.Var(scope, mk_unique_var("$h5_size_var"), loc)
+            size_vars.append(size_var)
             size_call = ir.Expr.call(attr_var, [f_id, dset, dim_var], (), loc)
             size_assign = ir.Assign(size_call, size_var, loc)
             out.append(size_assign)
-        return [size_var]
+        return size_vars
+
+    def _gen_h5read_call(self, f_id, dset, size_vars, lhs_var, scope, loc, out):
+        # g_pio_var = Global(numba.pio)
+        g_pio_var = ir.Var(scope, mk_unique_var("$pio_g_var"), loc)
+        g_pio = ir.Global('pio', numba.pio, loc)
+        g_pio_assign = ir.Assign(g_pio, g_pio_var, loc)
+        # attr call: h5size_attr = getattr(g_pio_var, h5read)
+        h5size_attr_call = ir.Expr.getattr(g_pio_var, "h5read", loc)
+        attr_var = ir.Var(scope, mk_unique_var("$h5read_attr"), loc)
+        attr_assign = ir.Assign(h5size_attr_call, attr_var, loc)
+        out += [g_pio_assign, attr_assign]
+
+        ndims = len(size_vars)
+        ndims_var = ir.Var(scope, mk_unique_var("$h5_ndims"), loc)
+        ndims_assign = ir.Assign(ir.Const(np.int32(ndims), loc), ndims_var, loc)
+        sizes_var = ir.Var(scope, mk_unique_var("$h5_sizes"), loc)
+        tuple_call = ir.Expr.build_tuple(size_vars, loc)
+        sizes_assign = ir.Assign(tuple_call, sizes_var, loc)
+        out += [ndims_assign, sizes_assign]
+
+        err_var = ir.Var(scope, mk_unique_var("$h5_err_var"), loc)
+        read_call = ir.Expr.call(attr_var, [f_id, dset, ndims_var, sizes_var, lhs_var], (), loc)
+        out.append(ir.Assign(read_call, err_var, loc))
+        return
 
     def _get_dset_type(self, lhs, file_name, dset_str):
         """get data set type from user-specified locals types or actual file"""
@@ -133,7 +160,11 @@ from numba.typing import signature
 
 def h5size():
     """dummy function for C h5_size"""
-    pass
+    return
+
+def h5read():
+    """dummy function for C h5_read"""
+    return
 
 @infer_global(h5py.File)
 class H5File(AbstractTemplate):
@@ -148,6 +179,13 @@ class H5Size(AbstractTemplate):
         assert not kws
         assert len(args)==3
         return signature(types.int64, *args)
+
+@infer_global(h5read)
+class H5Read(AbstractTemplate):
+    def generic(self, args, kws):
+        assert not kws
+        assert len(args)==5
+        return signature(types.int32, *args)
 
 from llvmlite import ir as lir
 
@@ -174,3 +212,22 @@ def h5_size(context, builder, sig, args):
     fnty = lir.FunctionType(lir.IntType(64), [lir.IntType(32), lir.IntType(8).as_pointer(), lir.IntType(32)])
     fn = builder.module.get_or_insert_function(fnty, name="numba_h5_size")
     return builder.call(fn, [args[0], val2, args[2]])
+import pdb
+@lower_builtin(h5read, types.int32, types.Const, types.int32, types.containers.UniTuple, types.npytypes.Array)
+def h5_read(context, builder, sig, args):
+    # works for constant string only
+    # TODO: extend to string variables
+    dset_name_arg = sig.args[1]
+    val2 = context.insert_const_string(builder.module, dset_name_arg.value)
+    fnty = lir.FunctionType(lir.IntType(32), [lir.IntType(32), lir.IntType(8).as_pointer(),
+        lir.IntType(32), lir.IntType(64).as_pointer(), lir.IntType(8).as_pointer()])
+
+    fn = builder.module.get_or_insert_function(fnty, name="numba_h5_read")
+    out = make_array(sig.args[4])(context, builder, args[4])
+    # store size vars array struct to pointer
+    size_ptr = cgutils.alloca_once(builder, args[3].type)
+    builder.store(args[3], size_ptr)
+
+    return builder.call(fn, [args[0], val2, args[2],
+        builder.bitcast(size_ptr, lir.IntType(64).as_pointer()),
+        builder.bitcast(out.data, lir.IntType(8).as_pointer())])
