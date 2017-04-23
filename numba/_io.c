@@ -33,11 +33,9 @@ numba_h5_size(hid_t file_id, char* dset_name, int dim)
 }
 
 NUMBA_EXPORT_FUNC(int)
-numba_h5_read(hid_t file_id, char* dset_name, int ndims, int64_t* sizes, void* out)
+numba_h5_read(hid_t file_id, char* dset_name, int ndims, int64_t* sizes, void* out, int typ_enum)
 {
-    // printf("ndims: %d sizes:%lld\n", ndims, sizes);
-    // fflush(stdout);
-    // printf("size:%d\n", sizes[0]);
+    //printf("dset_name:%s ndims:%d size:%d typ:%d\n", dset_name, ndims, sizes[0], typ_enum);
     // fflush(stdout);
     hid_t dataset_id;
     herr_t ret;
@@ -49,13 +47,33 @@ numba_h5_read(hid_t file_id, char* dset_name, int ndims, int64_t* sizes, void* o
     hsize_t HDF5_start[ndims];
     for(int i=0; i<ndims; i++)
         HDF5_start[i] = 0;
-    hsize_t* HDF5_count = sizes;
+    hsize_t* HDF5_count = (hsize_t*)sizes;
     ret = H5Sselect_hyperslab(space_id, H5S_SELECT_SET, HDF5_start, NULL, HDF5_count, NULL);
     assert(ret != -1);
-    hid_t mem_dataspace = H5Screate_simple(ndims, HDF5_count, NULL);
+    hid_t mem_dataspace = H5Screate_simple((hsize_t)ndims, HDF5_count, NULL);
     assert (mem_dataspace != -1);
-    ret = H5Dread(dataset_id, H5T_NATIVE_FLOAT, mem_dataspace, space_id, H5P_DEFAULT, out);
+    hid_t h5_typ = get_h5_typ(typ_enum);
+    ret = H5Dread(dataset_id, h5_typ, mem_dataspace, space_id, H5P_DEFAULT, out);
     assert(ret != -1);
+    // printf("out: %lf %lf ...\n", ((double*)out)[0], ((double*)out)[1]);
     H5Dclose(dataset_id);
     return ret;
+}
+
+
+// _h5_typ_table = {
+//     int8:0,
+//     uint8:1,
+//     int32:2,
+//     int64:3,
+//     float32:4,
+//     float64:5
+//     }
+
+hid_t get_h5_typ(typ_enum)
+{
+    // printf("h5 type enum:%d\n", typ_enum);
+    hid_t types_list[] = {H5T_NATIVE_CHAR, H5T_NATIVE_UCHAR,
+            H5T_NATIVE_INT, H5T_NATIVE_LLONG, H5T_NATIVE_FLOAT, H5T_NATIVE_DOUBLE};
+    return types_list[typ_enum];
 }
