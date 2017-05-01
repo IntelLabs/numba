@@ -196,6 +196,7 @@ class CPUTargetOptions(TargetOptions):
         "fastmath": bool,
         "error_model": str,
         "parallel": bool,
+        "distributed": bool,
     }
 
 

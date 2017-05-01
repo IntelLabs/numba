@@ -19,6 +19,7 @@ from numba.annotations import type_annotations
 from numba.parfor import ParforPass
 from numba.inline_closurecall import InlineClosureCallPass
 from numba.pio import PIO
+from numba.distributed import DistributedPass
 
 # Lock for the preventing multiple compiler execution
 lock_compiler = threading.RLock()
@@ -45,6 +46,7 @@ class Flags(utils.ConfigOptions):
         'forceinline': False,
         'no_cpython_wrapper': False,
         'auto_parallel': False,
+        'distributed': False,
         'nrt': False,
         'no_rewrites': False,
         'error_model': 'python',
@@ -519,6 +521,15 @@ class Pipeline(object):
         io_pass = PIO(self.func_ir, self.locals)
         io_pass.run()
 
+    def stage_distributed_pass(self):
+        """
+        parallelize for distributed-memory
+        """
+        # Ensure we have an IR and type information.
+        assert self.func_ir
+        dist_pass = DistributedPass(self.func_ir, self.type_annotation.typemap)
+        dist_pass.run()
+
     def stage_annotate_type(self):
         """
         Create type annotation after type inference
@@ -674,6 +685,8 @@ class Pipeline(object):
                 pm.add_stage(self.stage_nopython_rewrites, "nopython rewrites")
             if self.flags.auto_parallel:
                 pm.add_stage(self.stage_parfor_pass, "convert to parfors")
+            if self.flags.distributed:
+                pm.add_stage(self.stage_distributed_pass, "convert to distributed")
             pm.add_stage(self.stage_nopython_backend, "nopython mode backend")
             pm.add_stage(self.stage_cleanup, "cleanup intermediate results")
 
@@ -729,6 +742,8 @@ def _make_subtarget(targetctx, flags):
         subtargetoptions['enable_nrt'] = True
     if flags.auto_parallel:
         subtargetoptions['auto_parallel'] = True
+    if flags.distributed:
+        subtargetoptions['distributed'] = True
     if flags.fastmath:
         subtargetoptions['enable_fastmath'] = True
     error_model = callconv.create_error_model(flags.error_model, targetctx)
