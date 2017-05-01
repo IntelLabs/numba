@@ -67,6 +67,9 @@ class TargetOptions(object):
         if kws.pop('parallel', False):
             flags.set('auto_parallel')
 
+        if kws.pop('distributed', False):
+            flags.set('distributed')
+
         if kws.pop('fastmath', False):
             flags.set('fastmath')
 
@@ -78,4 +81,3 @@ class TargetOptions(object):
         if kws:
             # Unread options?
             raise NameError("Unrecognized options: %s" % kws.keys())
-

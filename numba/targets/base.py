@@ -205,6 +205,9 @@ class BaseContext(object):
     # Auto parallelization
     auto_parallel = False
 
+    # distributed
+    distributed = False
+
     # PYCC
     aot_mode = False
 
