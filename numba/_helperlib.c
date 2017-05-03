@@ -928,6 +928,7 @@ numba_unpickle(const char *data, int n)
 
 #include "_lapack.c"
 #include "_io.c"
+#include "_distributed.c"
 
 /*
  * PRNG support

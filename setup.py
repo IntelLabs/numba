@@ -107,7 +107,7 @@ def get_ext_modules():
                               sources=["numba/_helpermod.c",
                                        "numba/_math_c99.c"],
                               extra_compile_args=CFLAGS,
-                              extra_link_args=install_name_tool_fixer+['-lhdf5'],
+                              extra_link_args=install_name_tool_fixer+['-lhdf5 -lmpi -lpmpi'],
                               depends=["numba/_pymodule.h",
                                        "numba/_math_c99.h",
                                        "numba/_helperlib.c",

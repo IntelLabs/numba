@@ -105,6 +105,7 @@ build_c_helpers_dict(void)
     declmethod(h5_open);
     declmethod(h5_size);
     declmethod(h5_read);
+    declmethod(get_rank);
 
     /* PRNG support */
     declmethod(get_py_random_state);
