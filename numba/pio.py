@@ -91,7 +91,7 @@ class PIO(object):
 
     def _gen_h5size(self, f_id, dset, ndims, scope, loc, out):
         # g_pio_var = Global(numba.pio)
-        g_pio_var = ir.Var(scope, mk_unique_var("$np_g_var"), loc)
+        g_pio_var = ir.Var(scope, mk_unique_var("$pio_g_var"), loc)
         g_pio = ir.Global('pio', numba.pio, loc)
         g_pio_assign = ir.Assign(g_pio, g_pio_var, loc)
         # attr call: h5size_attr = getattr(g_pio_var, h5size)

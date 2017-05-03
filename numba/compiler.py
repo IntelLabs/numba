@@ -510,7 +510,8 @@ class Pipeline(object):
         """
         # Ensure we have an IR and type information.
         assert self.func_ir
-        dist_pass = DistributedPass(self.func_ir, self.type_annotation.typemap)
+        dist_pass = DistributedPass(self.func_ir, self.type_annotation.typemap,
+            self.type_annotation.calltypes)
         dist_pass.run()
 
     def stage_annotate_type(self):
