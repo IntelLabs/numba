@@ -31,6 +31,7 @@ class DistributedPass(object):
         self.typemap = typemap
         self.calltypes = calltypes
         self._rank_var = None # will be set in run
+        self._size_var = None
 
     def run(self):
         dprint_func_ir(self.func_ir, "starting distributed pass")
@@ -107,6 +108,20 @@ class DistributedPass(object):
         self._rank_var = rank_var
         out += [g_mpi_assign, rank_attr_assign, rank_assign]
 
+        # attr call: size_attr = getattr(g_mpi_var, get_size)
+        size_attr_call = ir.Expr.getattr(g_mpi_var, "get_size", loc)
+        size_attr_var = ir.Var(scope, mk_unique_var("$get_size_attr"), loc)
+        self.typemap[size_attr_var.name] = get_global_func_typ(get_size)
+        size_attr_assign = ir.Assign(size_attr_call, size_attr_var, loc)
+        # size_var = numba.distributed.get_size()
+        size_var = ir.Var(scope, mk_unique_var("$dist_size"), loc)
+        self.typemap[size_var.name] = types.int32
+        size_call = ir.Expr.call(size_attr_var, [], (), loc)
+        self.calltypes[size_call] = self.typemap[size_attr_var.name].get_call_type(
+            typing.Context(), [], {})
+        size_assign = ir.Assign(size_call, size_var, loc)
+        self._size_var = size_var
+        out += [size_attr_assign, size_assign]
         return out
 
     def _run_assign(self):
@@ -125,8 +140,19 @@ def get_rank():
     """dummy function for C mpi get_rank"""
     return 0
 
+def get_size():
+    """dummy function for C mpi get_size"""
+    return 0
+
 @infer_global(get_rank)
 class DistRank(AbstractTemplate):
+    def generic(self, args, kws):
+        assert not kws
+        assert len(args)==0
+        return signature(types.int32, *args)
+
+@infer_global(get_size)
+class DistSize(AbstractTemplate):
     def generic(self, args, kws):
         assert not kws
         assert len(args)==0
@@ -137,5 +163,11 @@ from llvmlite import ir as lir
 @lower_builtin(get_rank)
 def dist_get_rank(context, builder, sig, args):
     fnty = lir.FunctionType(lir.IntType(32), [])
-    fn = builder.module.get_or_insert_function(fnty, name="numba_get_rank")
+    fn = builder.module.get_or_insert_function(fnty, name="numba_dist_get_rank")
+    return builder.call(fn, [])
+
+@lower_builtin(get_size)
+def dist_get_size(context, builder, sig, args):
+    fnty = lir.FunctionType(lir.IntType(32), [])
+    fn = builder.module.get_or_insert_function(fnty, name="numba_dist_get_size")
     return builder.call(fn, [])
