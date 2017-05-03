@@ -4,9 +4,9 @@ from collections import namedtuple
 import types as pytypes # avoid confusion with numba.types
 
 import numba
-from numba import ir, analysis, types, config, numpy_support, cgutils
+from numba import ir, analysis, types, typing, config, numpy_support, cgutils
 from numba.ir_utils import (mk_unique_var, replace_vars_inner, find_topo_order,
-                            dprint_func_ir, remove_dead, mk_alloc)
+                            dprint_func_ir, remove_dead, mk_alloc, get_global_func_typ)
 
 from numba.targets.imputils import lower_builtin
 from numba.targets.arrayobj import make_array
@@ -95,11 +95,14 @@ class DistributedPass(object):
         # attr call: rank_attr = getattr(g_mpi_var, get_rank)
         rank_attr_call = ir.Expr.getattr(g_mpi_var, "get_rank", loc)
         rank_attr_var = ir.Var(scope, mk_unique_var("$get_rank_attr"), loc)
-        # typemap =
+        self.typemap[rank_attr_var.name] = get_global_func_typ(get_rank)
         rank_attr_assign = ir.Assign(rank_attr_call, rank_attr_var, loc)
         # rank_var = numba.distributed.get_rank()
         rank_var = ir.Var(scope, mk_unique_var("$rank"), loc)
+        self.typemap[rank_var.name] = types.int32
         rank_call = ir.Expr.call(rank_attr_var, [], (), loc)
+        self.calltypes[rank_call] = self.typemap[rank_attr_var.name].get_call_type(
+            typing.Context(), [], {})
         rank_assign = ir.Assign(rank_call, rank_var, loc)
         self._rank_var = rank_var
         out += [g_mpi_assign, rank_attr_assign, rank_assign]
@@ -114,3 +117,25 @@ class DistributedPass(object):
 
     def _isarray(self, varname):
         return isinstance(self.typemap[varname], types.npytypes.Array)
+
+from numba.typing.templates import infer_global, AbstractTemplate
+from numba.typing import signature
+
+def get_rank():
+    """dummy function for C mpi get_rank"""
+    return 0
+
+@infer_global(get_rank)
+class DistRank(AbstractTemplate):
+    def generic(self, args, kws):
+        assert not kws
+        assert len(args)==0
+        return signature(types.int32, *args)
+
+from llvmlite import ir as lir
+
+@lower_builtin(get_rank)
+def dist_get_rank(context, builder, sig, args):
+    fnty = lir.FunctionType(lir.IntType(32), [])
+    fn = builder.module.get_or_insert_function(fnty, name="numba_get_rank")
+    return builder.call(fn, [])
