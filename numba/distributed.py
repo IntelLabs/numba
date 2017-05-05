@@ -6,8 +6,9 @@ import types as pytypes # avoid confusion with numba.types
 import numba
 from numba import ir, analysis, types, typing, config, numpy_support, cgutils
 from numba.ir_utils import (mk_unique_var, replace_vars_inner, find_topo_order,
-                            dprint_func_ir, remove_dead, mk_alloc, get_global_func_typ, find_op_typ)
+                            dprint_func_ir, remove_dead, mk_alloc, get_global_func_typ, find_op_typ, get_name_var_table)
 
+from numba.parfor import get_parfor_reductions
 from numba.targets.imputils import lower_builtin
 from numba.targets.arrayobj import make_array
 from numba.parfor import Parfor
@@ -81,6 +82,7 @@ class DistributedPass(object):
 
     def _run_dist_pass(self):
         topo_order = find_topo_order(self.func_ir.blocks)
+        namevar_table = get_name_var_table(self.func_ir.blocks)
         # add initializations
         first_block = self.func_ir.blocks[topo_order[0]]
         # set scope and loc of generated code to the first variable in block
@@ -94,7 +96,7 @@ class DistributedPass(object):
             new_body = []
             for inst in self.func_ir.blocks[label].body:
                 if isinstance(inst, Parfor):
-                    new_body += self._run_parfor(inst)
+                    new_body += self._run_parfor(inst, namevar_table)
                     continue
                 new_body.append(inst)
             self.func_ir.blocks[label].body = new_body
@@ -141,7 +143,7 @@ class DistributedPass(object):
     def _run_assign(self):
         return
 
-    def _run_parfor(self, parfor):
+    def _run_parfor(self, parfor, namevar_table):
         if self._dist_analysis.parfor_dists[parfor.id]!=Distribution.OneD:
             if config.DEBUG_ARRAY_OPT==1:
                 print("parfor "+str(parfor.id)+" not parallelized.")
@@ -180,6 +182,23 @@ class DistributedPass(object):
         parfor.loop_nests[0].range_variable = end_var
         out += [div_assign, start_assign, end_attr_assign, end_assign]
         out.append(parfor)
+        _, reductions = get_parfor_reductions(parfor)
+
+        if len(reductions)!=0:
+            reduce_attr_var = ir.Var(scope, mk_unique_var("$reduce_attr"), loc)
+            reduce_attr_call = ir.Expr.getattr(self._g_dist_var, "dist_reduce", loc)
+            self.typemap[reduce_attr_var.name] = get_global_func_typ(dist_reduce)
+            reduce_assign = ir.Assign(reduce_attr_call, reduce_attr_var, loc)
+            out.append(reduce_assign)
+
+        for reduce_varname, (_, reduce_func) in reductions.items():
+            reduce_var = namevar_table[reduce_varname]
+            reduce_call = ir.Expr.call(reduce_attr_var, [reduce_var], (), loc)
+            self.calltypes[reduce_call] = self.typemap[reduce_attr_var.name].get_call_type(
+                typing.Context(), [self.typemap[reduce_varname]], {})
+            reduce_assign = ir.Assign(reduce_call, reduce_var, loc)
+            out.append(reduce_assign)
+
         return out
 
     def _isarray(self, varname):
@@ -199,6 +218,10 @@ def get_size():
 def get_end(total_size, div, pes, rank):
     """get end point of range for parfor division"""
     return total_size if rank==pes-1 else (rank+1)*div
+
+def dist_reduce(value):
+    """dummy to implement simple reductions"""
+    return value
 
 @infer_global(get_rank)
 class DistRank(AbstractTemplate):
@@ -221,6 +244,13 @@ class DistEnd(AbstractTemplate):
         assert len(args)==4
         return signature(types.int64, *args)
 
+@infer_global(dist_reduce)
+class DistReduce(AbstractTemplate):
+    def generic(self, args, kws):
+        assert not kws
+        assert len(args)==1
+        return signature(args[0], *args)
+
 from llvmlite import ir as lir
 
 @lower_builtin(get_rank)
@@ -241,3 +271,13 @@ def dist_get_end(context, builder, sig, args):
                                             lir.IntType(32), lir.IntType(32)])
     fn = builder.module.get_or_insert_function(fnty, name="numba_dist_get_end")
     return builder.call(fn, [args[0], args[1], args[2], args[3]])
+
+@lower_builtin(dist_reduce, types.int64)
+@lower_builtin(dist_reduce, types.int32)
+@lower_builtin(dist_reduce, types.float32)
+@lower_builtin(dist_reduce, types.float64)
+def lower_dist_reduce(context, builder, sig, args):
+    ltyp = args[0].type
+    fnty = lir.FunctionType(ltyp, [ltyp])
+    fn = builder.module.get_or_insert_function(fnty, name="numba_dist_reduce")
+    return builder.call(fn, [args[0]])

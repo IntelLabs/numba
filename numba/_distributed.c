@@ -24,3 +24,11 @@ numba_dist_get_end(int64_t total, int64_t div_chunk, int num_pes, int node_id)
 {
     return ((node_id==num_pes-1) ? total : (node_id+1)*div_chunk);
 }
+
+NUMBA_EXPORT_FUNC(double)
+numba_dist_reduce(double value)
+{
+    double out=0;
+    MPI_Allreduce(&value, &out, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    return out;
+}
