@@ -18,3 +18,9 @@ numba_dist_get_size()
     printf("mpi_size:%d\n", size);
     return size;
 }
+
+NUMBA_EXPORT_FUNC(int64_t)
+numba_dist_get_end(int64_t total, int64_t div_chunk, int num_pes, int node_id)
+{
+    return ((node_id==num_pes-1) ? total : (node_id+1)*div_chunk);
+}
