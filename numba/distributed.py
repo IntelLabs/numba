@@ -6,7 +6,7 @@ import types as pytypes # avoid confusion with numba.types
 import numba
 from numba import ir, analysis, types, typing, config, numpy_support, cgutils
 from numba.ir_utils import (mk_unique_var, replace_vars_inner, find_topo_order,
-                            dprint_func_ir, remove_dead, mk_alloc, get_global_func_typ)
+                            dprint_func_ir, remove_dead, mk_alloc, get_global_func_typ, find_op_typ)
 
 from numba.targets.imputils import lower_builtin
 from numba.targets.arrayobj import make_array
@@ -14,7 +14,7 @@ from numba.parfor import Parfor
 import numpy as np
 
 import h5py
-from mpi4py import MPI
+# from mpi4py import MPI
 
 from enum import Enum
 class Distribution(Enum):
@@ -155,11 +155,13 @@ class DistributedPass(object):
         div_var = ir.Var(scope, mk_unique_var("$loop_div_var"), loc)
         self.typemap[div_var.name] = types.int64
         div_expr = ir.Expr.binop('//', range_size, self._size_var, loc)
+        self.calltypes[div_expr] = find_op_typ('//', [types.int64, types.int32])
         div_assign = ir.Assign(div_expr, div_var, loc)
 
         start_var = ir.Var(scope, mk_unique_var("$loop_start_var"), loc)
         self.typemap[start_var.name] = types.int64
         start_expr = ir.Expr.binop('*', div_var, self._rank_var, loc)
+        self.calltypes[start_expr] = find_op_typ('*', [types.int64, types.int32])
         start_assign = ir.Assign(start_expr, start_var, loc)
         # TODO: start loop iteration
         # attr call: end_attr = getattr(g_dist_var, get_end)
@@ -175,6 +177,7 @@ class DistributedPass(object):
         self.calltypes[end_expr] = self.typemap[end_attr_var.name].get_call_type(
             typing.Context(), [types.int64, types.int64, types.int32, types.int32], {})
         end_assign = ir.Assign(end_expr, end_var, loc)
+        parfor.loop_nests[0].range_variable = end_var
         out += [div_assign, start_assign, end_attr_assign, end_assign]
         out.append(parfor)
         return out
@@ -232,9 +235,9 @@ def dist_get_size(context, builder, sig, args):
     fn = builder.module.get_or_insert_function(fnty, name="numba_dist_get_size")
     return builder.call(fn, [])
 
-@lower_builtin(get_end)
+@lower_builtin(get_end, types.int64, types.int64, types.int32, types.int32)
 def dist_get_end(context, builder, sig, args):
-    fnty = lir.FunctionType(lir.IntType(64), [])
-    # TODO: add vars
+    fnty = lir.FunctionType(lir.IntType(64), [lir.IntType(64), lir.IntType(64),
+                                            lir.IntType(32), lir.IntType(32)])
     fn = builder.module.get_or_insert_function(fnty, name="numba_dist_get_end")
-    return builder.call(fn, [])
+    return builder.call(fn, [args[0], args[1], args[2], args[3]])
