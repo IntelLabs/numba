@@ -11,7 +11,7 @@ from numba.ir_utils import (mk_unique_var, replace_vars_inner, find_topo_order,
 from numba.parfor import get_parfor_reductions
 from numba.targets.imputils import lower_builtin
 from numba.targets.arrayobj import make_array
-from numba.parfor import Parfor
+from numba.parfor import Parfor, lower_parfor_sequential
 import numpy as np
 
 import h5py
@@ -69,7 +69,7 @@ class DistributedPass(object):
         if self._isarray(lhs) and lhs not in array_dists:
             array_dists[lhs] = Distribution.OneD
 
-        if isinstance(rhs, ir.Var):
+        if isinstance(rhs, ir.Var) and self._isarray(lhs):
             new_dist = min(array_dists[lhs].value, array_dists[rhs.name].value)
             array_dists[lhs] = Distribution(new_dist)
             array_dists[rhs.name] = Distribution(new_dist)
@@ -100,6 +100,7 @@ class DistributedPass(object):
                     continue
                 new_body.append(inst)
             self.func_ir.blocks[label].body = new_body
+        lower_parfor_sequential(self.func_ir, self.typemap, self.calltypes)
 
     def _get_dist_inits(self, scope, loc):
         out = []
@@ -152,7 +153,7 @@ class DistributedPass(object):
         scope = parfor.init_block.scope
         loc = parfor.init_block.loc
         out = []
-        range_size = parfor.loop_nests[0].range_variable
+        range_size = parfor.loop_nests[0].stop
 
         div_var = ir.Var(scope, mk_unique_var("$loop_div_var"), loc)
         self.typemap[div_var.name] = types.int64
@@ -165,7 +166,7 @@ class DistributedPass(object):
         start_expr = ir.Expr.binop('*', div_var, self._rank_var, loc)
         self.calltypes[start_expr] = find_op_typ('*', [types.int64, types.int32])
         start_assign = ir.Assign(start_expr, start_var, loc)
-        # TODO: start loop iteration
+        parfor.loop_nests[0].start = start_var
         # attr call: end_attr = getattr(g_dist_var, get_end)
         end_attr_call = ir.Expr.getattr(self._g_dist_var, "get_end", loc)
         end_attr_var = ir.Var(scope, mk_unique_var("$get_end_attr"), loc)
@@ -179,7 +180,7 @@ class DistributedPass(object):
         self.calltypes[end_expr] = self.typemap[end_attr_var.name].get_call_type(
             typing.Context(), [types.int64, types.int64, types.int32, types.int32], {})
         end_assign = ir.Assign(end_expr, end_var, loc)
-        parfor.loop_nests[0].range_variable = end_var
+        parfor.loop_nests[0].stop = end_var
         out += [div_assign, start_assign, end_attr_assign, end_assign]
         out.append(parfor)
         _, reductions = get_parfor_reductions(parfor)
