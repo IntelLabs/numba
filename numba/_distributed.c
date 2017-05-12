@@ -15,7 +15,7 @@ numba_dist_get_size()
 {
     int size;
     MPI_Comm_size(MPI_COMM_WORLD, &size);
-    printf("mpi_size:%d\n", size);
+    // printf("mpi_size:%d\n", size);
     return size;
 }
 
@@ -28,6 +28,7 @@ numba_dist_get_end(int64_t total, int64_t div_chunk, int num_pes, int node_id)
 NUMBA_EXPORT_FUNC(double)
 numba_dist_reduce(double value)
 {
+    // printf("sum value: %lf\n", value);
     double out=0;
     MPI_Allreduce(&value, &out, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
     return out;
