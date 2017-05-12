@@ -43,6 +43,7 @@ class DistributedPass(object):
             print("distributions: ", self._dist_analysis)
         self._run_dist_pass()
         dprint_func_ir(self.func_ir, "after distributed pass")
+        lower_parfor_sequential(self.func_ir, self.typemap, self.calltypes)
 
     def _analyze_dist(self):
         topo_order = find_topo_order(self.func_ir.blocks)
@@ -100,7 +101,6 @@ class DistributedPass(object):
                     continue
                 new_body.append(inst)
             self.func_ir.blocks[label].body = new_body
-        lower_parfor_sequential(self.func_ir, self.typemap, self.calltypes)
 
     def _get_dist_inits(self, scope, loc):
         out = []
@@ -182,6 +182,9 @@ class DistributedPass(object):
         end_assign = ir.Assign(end_expr, end_var, loc)
         parfor.loop_nests[0].stop = end_var
         out += [div_assign, start_assign, end_attr_assign, end_assign]
+        # print_node = ir.Print([div_var, start_var, end_var], None, loc)
+        # self.calltypes[print_node] = signature(types.none, types.int64, types.int64, types.int64)
+        # out.append(print_node)
         out.append(parfor)
         _, reductions = get_parfor_reductions(parfor)
 
