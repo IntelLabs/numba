@@ -6,9 +6,11 @@ import types as pytypes # avoid confusion with numba.types
 import numba
 from numba import ir, analysis, types, typing, config, numpy_support, cgutils
 from numba.ir_utils import (mk_unique_var, replace_vars_inner, find_topo_order,
-                            dprint_func_ir, remove_dead, mk_alloc, get_global_func_typ, find_op_typ, get_name_var_table)
+                            dprint_func_ir, remove_dead, mk_alloc,
+                            get_global_func_typ, find_op_typ, get_name_var_table,
+                            get_call_table)
 
-from numba.parfor import get_parfor_reductions
+from numba.parfor import get_parfor_reductions, wrap_parfor_blocks, unwrap_parfor_blocks
 from numba.targets.imputils import lower_builtin
 from numba.targets.arrayobj import make_array
 from numba.parfor import Parfor, lower_parfor_sequential
@@ -31,6 +33,7 @@ class DistributedPass(object):
         self.func_ir = func_ir
         self.typemap = typemap
         self.calltypes = calltypes
+        self._call_table,_ = get_call_table(func_ir.blocks)
         self._rank_var = None # will be set in run
         self._size_var = None
         self._dist_analysis = None
@@ -41,7 +44,8 @@ class DistributedPass(object):
         self._dist_analysis = self._analyze_dist()
         if config.DEBUG_ARRAY_OPT==1:
             print("distributions: ", self._dist_analysis)
-        self._run_dist_pass()
+        self._gen_dist_inits()
+        self._run_dist_pass(self.func_ir.blocks)
         dprint_func_ir(self.func_ir, "after distributed pass")
         lower_parfor_sequential(self.func_ir, self.typemap, self.calltypes)
 
@@ -81,28 +85,26 @@ class DistributedPass(object):
             parfor_dists[parfor.id] = Distribution.OneD
         return
 
-    def _run_dist_pass(self):
-        topo_order = find_topo_order(self.func_ir.blocks)
-        namevar_table = get_name_var_table(self.func_ir.blocks)
-        # add initializations
-        first_block = self.func_ir.blocks[topo_order[0]]
-        # set scope and loc of generated code to the first variable in block
-        scope = first_block.body[0].target.scope
-        loc = first_block.body[0].target.loc
-        dist_inits = self._get_dist_inits(scope, loc)
-        first_block.body = dist_inits+first_block.body
-
+    def _run_dist_pass(self, blocks):
+        topo_order = find_topo_order(blocks)
+        namevar_table = get_name_var_table(blocks)
         #
         for label in topo_order:
             new_body = []
-            for inst in self.func_ir.blocks[label].body:
+            for inst in blocks[label].body:
                 if isinstance(inst, Parfor):
                     new_body += self._run_parfor(inst, namevar_table)
                     continue
                 new_body.append(inst)
-            self.func_ir.blocks[label].body = new_body
+            blocks[label].body = new_body
 
-    def _get_dist_inits(self, scope, loc):
+    def _gen_dist_inits(self):
+        # add initializations
+        topo_order = find_topo_order(self.func_ir.blocks)
+        first_block = self.func_ir.blocks[topo_order[0]]
+        # set scope and loc of generated code to the first variable in block
+        scope = first_block.body[0].target.scope
+        loc = first_block.body[0].target.loc
         out = []
         # g_dist_var = Global(numba.distributed)
         g_dist_var = ir.Var(scope, mk_unique_var("$distributed_g_var"), loc)
@@ -139,12 +141,17 @@ class DistributedPass(object):
         size_assign = ir.Assign(size_call, size_var, loc)
         self._size_var = size_var
         out += [size_attr_assign, size_assign]
-        return out
+        first_block.body = out+first_block.body
 
     def _run_assign(self):
         return
 
     def _run_parfor(self, parfor, namevar_table):
+        # run dist pass recursively
+        blocks = wrap_parfor_blocks(parfor)
+        self._run_dist_pass(blocks)
+        unwrap_parfor_blocks(parfor)
+
         if self._dist_analysis.parfor_dists[parfor.id]!=Distribution.OneD:
             if config.DEBUG_ARRAY_OPT==1:
                 print("parfor "+str(parfor.id)+" not parallelized.")
