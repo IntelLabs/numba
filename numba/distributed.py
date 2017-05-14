@@ -158,7 +158,8 @@ class DistributedPass(object):
         out = []
         # divide 1D alloc
         if self._is_1D_arr(lhs) and self._is_alloc_call(func_var):
-            pass
+            size_var = rhs.args[0]
+
         return [assign]
 
     def _run_parfor(self, parfor, namevar_table):
@@ -174,36 +175,11 @@ class DistributedPass(object):
         #
         scope = parfor.init_block.scope
         loc = parfor.init_block.loc
-        out = []
         range_size = parfor.loop_nests[0].stop
 
-        div_var = ir.Var(scope, mk_unique_var("$loop_div_var"), loc)
-        self.typemap[div_var.name] = types.int64
-        div_expr = ir.Expr.binop('//', range_size, self._size_var, loc)
-        self.calltypes[div_expr] = find_op_typ('//', [types.int64, types.int32])
-        div_assign = ir.Assign(div_expr, div_var, loc)
-
-        start_var = ir.Var(scope, mk_unique_var("$loop_start_var"), loc)
-        self.typemap[start_var.name] = types.int64
-        start_expr = ir.Expr.binop('*', div_var, self._rank_var, loc)
-        self.calltypes[start_expr] = find_op_typ('*', [types.int64, types.int32])
-        start_assign = ir.Assign(start_expr, start_var, loc)
+        out, start_var, end_var = self._gen_1D_div(range_size, scope, loc, "$loop", "get_end", get_end)
         parfor.loop_nests[0].start = start_var
-        # attr call: end_attr = getattr(g_dist_var, get_end)
-        end_attr_call = ir.Expr.getattr(self._g_dist_var, "get_end", loc)
-        end_attr_var = ir.Var(scope, mk_unique_var("$get_end_attr"), loc)
-        self.typemap[end_attr_var.name] = get_global_func_typ(get_end)
-        end_attr_assign = ir.Assign(end_attr_call, end_attr_var, loc)
-
-        end_var = ir.Var(scope, mk_unique_var("$loop_end_var"), loc)
-        self.typemap[end_var.name] = types.int64
-        end_expr = ir.Expr.call(end_attr_var, [range_size, div_var,
-            self._size_var, self._rank_var], (), loc)
-        self.calltypes[end_expr] = self.typemap[end_attr_var.name].get_call_type(
-            typing.Context(), [types.int64, types.int64, types.int32, types.int32], {})
-        end_assign = ir.Assign(end_expr, end_var, loc)
         parfor.loop_nests[0].stop = end_var
-        out += [div_assign, start_assign, end_attr_assign, end_assign]
         # print_node = ir.Print([div_var, start_var, end_var], None, loc)
         # self.calltypes[print_node] = signature(types.none, types.int64, types.int64, types.int64)
         # out.append(print_node)
@@ -226,6 +202,34 @@ class DistributedPass(object):
             out.append(reduce_assign)
 
         return out
+
+    def _gen_1D_div(self, size_var, scope, loc, prefix, end_call_name, end_call):
+        div_var = ir.Var(scope, mk_unique_var(prefix+"_div_var"), loc)
+        self.typemap[div_var.name] = types.int64
+        div_expr = ir.Expr.binop('//', size_var, self._size_var, loc)
+        self.calltypes[div_expr] = find_op_typ('//', [types.int64, types.int32])
+        div_assign = ir.Assign(div_expr, div_var, loc)
+
+        start_var = ir.Var(scope, mk_unique_var(prefix+"_start_var"), loc)
+        self.typemap[start_var.name] = types.int64
+        start_expr = ir.Expr.binop('*', div_var, self._rank_var, loc)
+        self.calltypes[start_expr] = find_op_typ('*', [types.int64, types.int32])
+        start_assign = ir.Assign(start_expr, start_var, loc)
+        # attr call: end_attr = getattr(g_dist_var, get_end)
+        end_attr_call = ir.Expr.getattr(self._g_dist_var, end_call_name, loc)
+        end_attr_var = ir.Var(scope, mk_unique_var("$get_end_attr"), loc)
+        self.typemap[end_attr_var.name] = get_global_func_typ(end_call)
+        end_attr_assign = ir.Assign(end_attr_call, end_attr_var, loc)
+
+        end_var = ir.Var(scope, mk_unique_var(prefix+"_end_var"), loc)
+        self.typemap[end_var.name] = types.int64
+        end_expr = ir.Expr.call(end_attr_var, [size_var, div_var,
+            self._size_var, self._rank_var], (), loc)
+        self.calltypes[end_expr] = self.typemap[end_attr_var.name].get_call_type(
+            typing.Context(), [types.int64, types.int64, types.int32, types.int32], {})
+        end_assign = ir.Assign(end_expr, end_var, loc)
+        div_nodes = [div_assign, start_assign, end_attr_assign, end_assign]
+        return div_nodes, start_var, end_var
 
     def _isarray(self, varname):
         return isinstance(self.typemap[varname], types.npytypes.Array)
