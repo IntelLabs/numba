@@ -102,9 +102,16 @@ class DistributedPass(object):
                 if isinstance(inst, ir.Assign):
                     lhs = inst.target.name
                     rhs = inst.value
-                    if isinstance(rhs, ir.Expr) and rhs.op=='call':
-                        new_body += self._run_call(inst)
-                        continue
+                    if isinstance(rhs, ir.Expr):
+                        if rhs.op=='call':
+                            new_body += self._run_call(inst)
+                            continue
+                        if rhs.op=='getitem':
+                            new_body += self._run_getitem(inst)
+                            continue
+                if isinstance(inst, ir.SetItem):
+                    new_body += self._run_setitem(inst)
+                    continue
                 new_body.append(inst)
             blocks[label].body = new_body
 
@@ -172,6 +179,34 @@ class DistributedPass(object):
             return out
 
         return [assign]
+
+    def _run_getitem(self, assign):
+        lhs = assign.target.name
+        rhs = assign.value
+        arr = rhs.value.name
+        index_var = rhs.index
+
+        if self._is_1D_arr(arr):
+            scope = index_var.scope
+            loc = index_var.loc
+            sub_assign = self._get_ind_sub(index_var, self._array_starts[arr])
+            rhs.index = sub_assign.target
+            return [sub_assign, assign]
+
+        return [assign]
+
+    def _run_setitem(self, stmt):
+        arr = stmt.target.name
+        index_var = stmt.index
+
+        if self._is_1D_arr(arr):
+            scope = index_var.scope
+            loc = index_var.loc
+            sub_assign = self._get_ind_sub(index_var, self._array_starts[arr])
+            stmt.index = sub_assign.target
+            return [sub_assign, stmt]
+
+        return [stmt]
 
     def _run_parfor(self, parfor, namevar_table):
         # run dist pass recursively
@@ -241,6 +276,14 @@ class DistributedPass(object):
         end_assign = ir.Assign(end_expr, end_var, loc)
         div_nodes = [div_assign, start_assign, end_attr_assign, end_assign]
         return div_nodes, start_var, end_var
+
+    def _get_ind_sub(self, ind_var, start_var):
+        sub_var = ir.Var(ind_var.scope, mk_unique_var("$sub_var"), ind_var.loc)
+        self.typemap[sub_var.name] = types.int64
+        sub_expr = ir.Expr.binop('-', ind_var, start_var, ind_var.loc)
+        self.calltypes[sub_expr] = find_op_typ('-', [types.int64, types.int64])
+        sub_assign = ir.Assign(sub_expr, sub_var, ind_var.loc)
+        return sub_assign
 
     def _isarray(self, varname):
         return isinstance(self.typemap[varname], types.npytypes.Array)
