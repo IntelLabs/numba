@@ -41,7 +41,7 @@ class DistributedPass(object):
 
     def run(self):
         dprint_func_ir(self.func_ir, "starting distributed pass")
-        self._dist_analysis = self._analyze_dist()
+        self._dist_analysis = self._analyze_dist(self.func_ir.blocks)
         if config.DEBUG_ARRAY_OPT==1:
             print("distributions: ", self._dist_analysis)
         self._gen_dist_inits()
@@ -49,16 +49,14 @@ class DistributedPass(object):
         dprint_func_ir(self.func_ir, "after distributed pass")
         lower_parfor_sequential(self.func_ir, self.typemap, self.calltypes)
 
-    def _analyze_dist(self):
-        topo_order = find_topo_order(self.func_ir.blocks)
-        array_dists = {}
-        parfor_dists = {}
+    def _analyze_dist(self, blocks, array_dists={}, parfor_dists={}):
+        topo_order = find_topo_order(blocks)
         save_array_dists = {}
         save_parfor_dists = {1:1} # dummy value
         # fixed-point iteration
         while array_dists!=save_array_dists or parfor_dists!=save_parfor_dists:
             for label in topo_order:
-                for inst in self.func_ir.blocks[label].body:
+                for inst in blocks[label].body:
                     if isinstance(inst, ir.Assign):
                         self._analyze_assign(inst, array_dists, parfor_dists)
                     elif isinstance(inst, Parfor):
@@ -83,6 +81,10 @@ class DistributedPass(object):
     def _analyze_parfor(self, parfor, array_dists, parfor_dists):
         if parfor.id not in parfor_dists:
             parfor_dists[parfor.id] = Distribution.OneD
+        # run analysis recursively on parfor body
+        blocks = wrap_parfor_blocks(parfor)
+        self._analyze_dist(blocks, array_dists, parfor_dists)
+        unwrap_parfor_blocks(parfor)
         return
 
     def _run_dist_pass(self, blocks):
@@ -95,6 +97,12 @@ class DistributedPass(object):
                 if isinstance(inst, Parfor):
                     new_body += self._run_parfor(inst, namevar_table)
                     continue
+                if isinstance(inst, ir.Assign):
+                    lhs = inst.target.name
+                    rhs = inst.value
+                    if isinstance(rhs, ir.Expr) and rhs.op=='call':
+                        new_body += self._run_call(inst)
+                        continue
                 new_body.append(inst)
             blocks[label].body = new_body
 
@@ -143,8 +151,15 @@ class DistributedPass(object):
         out += [size_attr_assign, size_assign]
         first_block.body = out+first_block.body
 
-    def _run_assign(self):
-        return
+    def _run_call(self, assign):
+        lhs = assign.target.name
+        rhs = assign.value
+        func_var = rhs.func.name
+        out = []
+        # divide 1D alloc
+        if self._is_1D_arr(lhs) and self._is_alloc_call(func_var):
+            pass
+        return [assign]
 
     def _run_parfor(self, parfor, namevar_table):
         # run dist pass recursively
@@ -214,6 +229,15 @@ class DistributedPass(object):
 
     def _isarray(self, varname):
         return isinstance(self.typemap[varname], types.npytypes.Array)
+
+    def _is_1D_arr(self, arr_name):
+        return (self._isarray(arr_name) and
+                self._dist_analysis.array_dists[arr_name]==Distribution.OneD)
+
+    def _is_alloc_call(self, func_var):
+        if func_var not in self._call_table:
+            return False
+        return self._call_table[func_var]==['empty', np]
 
 from numba.typing.templates import infer_global, AbstractTemplate
 from numba.typing import signature
