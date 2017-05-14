@@ -25,6 +25,14 @@ numba_dist_get_end(int64_t total, int64_t div_chunk, int num_pes, int node_id)
     return ((node_id==num_pes-1) ? total : (node_id+1)*div_chunk);
 }
 
+NUMBA_EXPORT_FUNC(int64_t)
+numba_dist_get_node_portion(int64_t total, int64_t div_chunk, int num_pes, int node_id)
+{
+    int64_t portion = ((node_id==num_pes-1) ? total-node_id*div_chunk : div_chunk);
+    // printf("portion:%lld\n", portion);
+    return portion;
+}
+
 NUMBA_EXPORT_FUNC(double)
 numba_dist_reduce(double value)
 {

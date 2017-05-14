@@ -38,6 +38,8 @@ class DistributedPass(object):
         self._size_var = None
         self._dist_analysis = None
         self._g_dist_var = None
+        self._array_starts = {}
+        self._array_counts = {}
 
     def run(self):
         dprint_func_ir(self.func_ir, "starting distributed pass")
@@ -159,6 +161,15 @@ class DistributedPass(object):
         # divide 1D alloc
         if self._is_1D_arr(lhs) and self._is_alloc_call(func_var):
             size_var = rhs.args[0]
+            scope = assign.target.scope
+            loc = assign.target.loc
+            out, start_var, end_var = self._gen_1D_div(size_var, scope, loc,
+                "$alloc", "get_node_portion", get_node_portion)
+            self._array_starts[lhs] = start_var
+            self._array_counts[lhs] = end_var
+            rhs.args[0] = end_var
+            out.append(assign)
+            return out
 
         return [assign]
 
@@ -258,6 +269,10 @@ def get_end(total_size, div, pes, rank):
     """get end point of range for parfor division"""
     return total_size if rank==pes-1 else (rank+1)*div
 
+def get_node_portion(total_size, div, pes, rank):
+    """get portion of size for alloc division"""
+    return total_size-div*rank if rank==pes-1 else div
+
 def dist_reduce(value):
     """dummy to implement simple reductions"""
     return value
@@ -278,6 +293,13 @@ class DistSize(AbstractTemplate):
 
 @infer_global(get_end)
 class DistEnd(AbstractTemplate):
+    def generic(self, args, kws):
+        assert not kws
+        assert len(args)==4
+        return signature(types.int64, *args)
+
+@infer_global(get_node_portion)
+class DistPortion(AbstractTemplate):
     def generic(self, args, kws):
         assert not kws
         assert len(args)==4
@@ -309,6 +331,13 @@ def dist_get_end(context, builder, sig, args):
     fnty = lir.FunctionType(lir.IntType(64), [lir.IntType(64), lir.IntType(64),
                                             lir.IntType(32), lir.IntType(32)])
     fn = builder.module.get_or_insert_function(fnty, name="numba_dist_get_end")
+    return builder.call(fn, [args[0], args[1], args[2], args[3]])
+
+@lower_builtin(get_node_portion, types.int64, types.int64, types.int32, types.int32)
+def dist_get_portion(context, builder, sig, args):
+    fnty = lir.FunctionType(lir.IntType(64), [lir.IntType(64), lir.IntType(64),
+                                            lir.IntType(32), lir.IntType(32)])
+    fn = builder.module.get_or_insert_function(fnty, name="numba_dist_get_node_portion")
     return builder.call(fn, [args[0], args[1], args[2], args[3]])
 
 @lower_builtin(dist_reduce, types.int64)

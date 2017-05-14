@@ -108,6 +108,7 @@ build_c_helpers_dict(void)
     declmethod(dist_get_rank);
     declmethod(dist_get_size);
     declmethod(dist_get_end);
+    declmethod(dist_get_node_portion);
     declmethod(dist_reduce);
 
     /* PRNG support */
