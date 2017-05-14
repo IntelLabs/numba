@@ -109,6 +109,9 @@ class DistributedPass(object):
                         if rhs.op=='getitem':
                             new_body += self._run_getitem(inst)
                             continue
+                    if isinstance(rhs, ir.Var) and self._is_1D_arr(rhs.name):
+                        self._array_starts[lhs] = self._array_starts[rhs.name]
+                        self._array_counts[lhs] = self._array_counts[rhs.name]
                 if isinstance(inst, ir.SetItem):
                     new_body += self._run_setitem(inst)
                     continue
