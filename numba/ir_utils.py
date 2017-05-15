@@ -395,6 +395,9 @@ def remove_dead_block(block, lives, args):
             if isinstance(rhs, ir.Var) and lhs.name==rhs.name:
                 continue
             # TODO: remove other nodes like SetItem etc.
+        if isinstance(stmt, ir.SetItem):
+            if stmt.target.name not in lives:
+                continue
 
         lives |= { v.name for v in stmt.list_vars() }
         if isinstance(stmt, ir.Assign):
