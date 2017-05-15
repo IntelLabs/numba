@@ -184,7 +184,7 @@ class H5Size(AbstractTemplate):
 class H5Read(AbstractTemplate):
     def generic(self, args, kws):
         assert not kws
-        assert len(args)==5
+        assert len(args)==5 or len(args)==7
         return signature(types.int32, *args)
 
 from llvmlite import ir as lir
@@ -213,14 +213,20 @@ def h5_size(context, builder, sig, args):
     fn = builder.module.get_or_insert_function(fnty, name="numba_h5_size")
     return builder.call(fn, [args[0], val2, args[2]])
 
-@lower_builtin(h5read, types.int32, types.Const, types.int32, types.containers.UniTuple, types.npytypes.Array)
+@lower_builtin(h5read, types.int32, types.Const, types.int32,
+    types.containers.UniTuple, types.npytypes.Array)
+@lower_builtin(h5read, types.int32, types.Const, types.int32,
+    types.containers.UniTuple, types.npytypes.Array, types.int64, types.int64)
 def h5_read(context, builder, sig, args):
     # insert the dset_name string arg
     dset_name_arg = sig.args[1]
     val2 = context.insert_const_string(builder.module, dset_name_arg.value)
-    fnty = lir.FunctionType(lir.IntType(32), [lir.IntType(32), lir.IntType(8).as_pointer(),
-        lir.IntType(32), lir.IntType(64).as_pointer(), lir.IntType(8).as_pointer(),
-        lir.IntType(32)])
+    arg_typs = [lir.IntType(32), lir.IntType(8).as_pointer(), lir.IntType(32),
+        lir.IntType(64).as_pointer(), lir.IntType(8).as_pointer(), lir.IntType(32)]
+    if len(args)==7:
+        # TODO: handle multi-dimensional
+        arg_typs += [lir.IntType(64), lir.IntType(64)]
+    fnty = lir.FunctionType(lir.IntType(32), arg_typs)
 
     fn = builder.module.get_or_insert_function(fnty, name="numba_h5_read")
     out = make_array(sig.args[4])(context, builder, args[4])
@@ -230,11 +236,15 @@ def h5_read(context, builder, sig, args):
     # store an int to specify data type
     typ_enum = _h5_typ_table[sig.args[4].dtype]
     typ_arg = cgutils.alloca_once_value(builder, lir.Constant(lir.IntType(32), typ_enum))
-
-    return builder.call(fn, [args[0], val2, args[2],
+    call_args = [args[0], val2, args[2],
         builder.bitcast(size_ptr, lir.IntType(64).as_pointer()),
         builder.bitcast(out.data, lir.IntType(8).as_pointer()),
-        builder.load(typ_arg)])
+        builder.load(typ_arg)]
+    if len(args)==7:
+        # TODO: handle multi-dimensional
+        call_args += [args[5], args[6]]
+
+    return builder.call(fn, call_args)
 
 _h5_typ_table = {
     types.int8:0,

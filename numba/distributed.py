@@ -181,6 +181,15 @@ class DistributedPass(object):
             out.append(assign)
             return out
 
+        if self._is_h5_read_call(func_var) and self._is_1D_arr(rhs.args[4].name):
+            arr = rhs.args[4].name
+            rhs.args += [self._array_starts[arr], self._array_counts[arr]]
+            # adjust call type
+            old_arg_typs = list(self.calltypes[rhs].args)
+            self.calltypes.pop(rhs)
+            self.calltypes[rhs] = self.typemap[func_var].get_call_type(
+                typing.Context(), old_arg_typs+[types.int64, types.int64], {})
+
         return [assign]
 
     def _run_getitem(self, assign):
@@ -299,6 +308,11 @@ class DistributedPass(object):
         if func_var not in self._call_table:
             return False
         return self._call_table[func_var]==['empty', np]
+
+    def _is_h5_read_call(self, func_var):
+        if func_var not in self._call_table:
+            return False
+        return self._call_table[func_var]==['h5read', numba.pio]
 
 from numba.typing.templates import infer_global, AbstractTemplate
 from numba.typing import signature
