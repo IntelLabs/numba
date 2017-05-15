@@ -62,6 +62,13 @@ class PIO(object):
             if rhs.op=='call' and rhs.func.name in self.h5_file_calls:
                 file_name = self.str_const_table[rhs.args[0].name]
                 self.h5_files[lhs] = file_name
+                # parallel arg = False for this stage
+                loc = assign.target.loc
+                scope = assign.target.scope
+                parallel_var = ir.Var(scope, mk_unique_var("$const_parallel"), loc)
+                parallel_assign = ir.Assign(ir.Const(0, loc), parallel_var, loc)
+                rhs.args.append(parallel_var)
+                return [parallel_assign, assign]
             # d = f['dset']
             if rhs.op=='static_getitem' and rhs.value.name in self.h5_files:
                 self.h5_dsets[lhs] = (rhs.value, rhs.index_var)
@@ -123,16 +130,25 @@ class PIO(object):
         attr_assign = ir.Assign(h5size_attr_call, attr_var, loc)
         out += [g_pio_assign, attr_assign]
 
+        # ndims args
         ndims = len(size_vars)
         ndims_var = ir.Var(scope, mk_unique_var("$h5_ndims"), loc)
         ndims_assign = ir.Assign(ir.Const(np.int32(ndims), loc), ndims_var, loc)
+        # sizes arg
         sizes_var = ir.Var(scope, mk_unique_var("$h5_sizes"), loc)
         tuple_call = ir.Expr.build_tuple(size_vars, loc)
         sizes_assign = ir.Assign(tuple_call, sizes_var, loc)
-        out += [ndims_assign, sizes_assign]
+
+        zero_var = ir.Var(scope, mk_unique_var("$const_zero"), loc)
+        zero_assign = ir.Assign(ir.Const(0, loc), zero_var, loc)
+        # starts: assign to zeros
+        starts_var = ir.Var(scope, mk_unique_var("$h5_starts"), loc)
+        start_tuple_call = ir.Expr.build_tuple([zero_var]*ndims, loc)
+        starts_assign = ir.Assign(start_tuple_call, starts_var, loc)
+        out += [ndims_assign, zero_assign, starts_assign, sizes_assign]
 
         err_var = ir.Var(scope, mk_unique_var("$h5_err_var"), loc)
-        read_call = ir.Expr.call(attr_var, [f_id, dset, ndims_var, sizes_var, lhs_var], (), loc)
+        read_call = ir.Expr.call(attr_var, [f_id, dset, ndims_var, starts_var, sizes_var, zero_var, lhs_var], (), loc)
         out.append(ir.Assign(read_call, err_var, loc))
         return
 
@@ -170,7 +186,7 @@ def h5read():
 class H5File(AbstractTemplate):
     def generic(self, args, kws):
         assert not kws
-        assert len(args)==2
+        assert len(args)==3
         return signature(types.int32, *args)
 
 @infer_global(h5size)
@@ -184,7 +200,7 @@ class H5Size(AbstractTemplate):
 class H5Read(AbstractTemplate):
     def generic(self, args, kws):
         assert not kws
-        assert len(args)==5 or len(args)==7
+        assert len(args)==7
         return signature(types.int32, *args)
 
 from llvmlite import ir as lir
@@ -192,16 +208,16 @@ from llvmlite import ir as lir
 #@lower_builtin(h5py.File, types.string, types.string)
 #@lower_builtin(h5py.File, types.string, types.Const)
 #@lower_builtin(h5py.File, types.Const, types.string)
-@lower_builtin(h5py.File, types.Const, types.Const)
+@lower_builtin(h5py.File, types.Const, types.Const, types.int64)
 def h5_open(context, builder, sig, args):
     # works for constant strings only
     # TODO: extend to string variables
-    arg1, arg2 = sig.args
+    arg1, arg2, _ = sig.args
     val1 = context.insert_const_string(builder.module, arg1.value)
     val2 = context.insert_const_string(builder.module, arg2.value)
-    fnty = lir.FunctionType(lir.IntType(32), [lir.IntType(8).as_pointer(), lir.IntType(8).as_pointer()])
+    fnty = lir.FunctionType(lir.IntType(32), [lir.IntType(8).as_pointer(), lir.IntType(8).as_pointer(), lir.IntType(64)])
     fn = builder.module.get_or_insert_function(fnty, name="numba_h5_open")
-    return builder.call(fn, [val1, val2])
+    return builder.call(fn, [val1, val2, args[2]])
 
 @lower_builtin(h5size, types.int32, types.Const, types.int32)
 def h5_size(context, builder, sig, args):
@@ -214,35 +230,33 @@ def h5_size(context, builder, sig, args):
     return builder.call(fn, [args[0], val2, args[2]])
 
 @lower_builtin(h5read, types.int32, types.Const, types.int32,
-    types.containers.UniTuple, types.npytypes.Array)
-@lower_builtin(h5read, types.int32, types.Const, types.int32,
-    types.containers.UniTuple, types.npytypes.Array, types.int64, types.int64)
+    types.containers.UniTuple, types.containers.UniTuple, types.int64,
+    types.npytypes.Array)
 def h5_read(context, builder, sig, args):
     # insert the dset_name string arg
     dset_name_arg = sig.args[1]
     val2 = context.insert_const_string(builder.module, dset_name_arg.value)
+    # extra last arg type for type enum
     arg_typs = [lir.IntType(32), lir.IntType(8).as_pointer(), lir.IntType(32),
-        lir.IntType(64).as_pointer(), lir.IntType(8).as_pointer(), lir.IntType(32)]
-    if len(args)==7:
-        # TODO: handle multi-dimensional
-        arg_typs += [lir.IntType(64), lir.IntType(64)]
+        lir.IntType(64).as_pointer(), lir.IntType(64).as_pointer(),
+        lir.IntType(64), lir.IntType(8).as_pointer(), lir.IntType(32)]
     fnty = lir.FunctionType(lir.IntType(32), arg_typs)
 
     fn = builder.module.get_or_insert_function(fnty, name="numba_h5_read")
-    out = make_array(sig.args[4])(context, builder, args[4])
+    out = make_array(sig.args[6])(context, builder, args[6])
     # store size vars array struct to pointer
-    size_ptr = cgutils.alloca_once(builder, args[3].type)
-    builder.store(args[3], size_ptr)
+    count_ptr = cgutils.alloca_once(builder, args[3].type)
+    builder.store(args[3], count_ptr)
+    size_ptr = cgutils.alloca_once(builder, args[4].type)
+    builder.store(args[4], size_ptr)
     # store an int to specify data type
-    typ_enum = _h5_typ_table[sig.args[4].dtype]
+    typ_enum = _h5_typ_table[sig.args[6].dtype]
     typ_arg = cgutils.alloca_once_value(builder, lir.Constant(lir.IntType(32), typ_enum))
     call_args = [args[0], val2, args[2],
-        builder.bitcast(size_ptr, lir.IntType(64).as_pointer()),
+        builder.bitcast(count_ptr, lir.IntType(64).as_pointer()),
+        builder.bitcast(size_ptr, lir.IntType(64).as_pointer()), args[5],
         builder.bitcast(out.data, lir.IntType(8).as_pointer()),
         builder.load(typ_arg)]
-    if len(args)==7:
-        # TODO: handle multi-dimensional
-        call_args += [args[5], args[6]]
 
     return builder.call(fn, call_args)
 

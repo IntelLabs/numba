@@ -38,6 +38,7 @@ class DistributedPass(object):
         self._size_var = None
         self._dist_analysis = None
         self._g_dist_var = None
+        self._set1_var = None # variable set to 1
         self._array_starts = {}
         self._array_counts = {}
 
@@ -104,7 +105,7 @@ class DistributedPass(object):
                     rhs = inst.value
                     if isinstance(rhs, ir.Expr):
                         if rhs.op=='call':
-                            new_body += self._run_call(inst)
+                            new_body += self._run_call(inst, blocks[label].body)
                             continue
                         if rhs.op=='getitem':
                             new_body += self._run_getitem(inst)
@@ -126,6 +127,10 @@ class DistributedPass(object):
         scope = first_block.body[0].target.scope
         loc = first_block.body[0].target.loc
         out = []
+        self._set1_var = ir.Var(scope, mk_unique_var("$const_parallel"), loc)
+        self.typemap[self._set1_var.name] = types.int64
+        set1_assign = ir.Assign(ir.Const(1, loc), self._set1_var, loc)
+        out.append(set1_assign)
         # g_dist_var = Global(numba.distributed)
         g_dist_var = ir.Var(scope, mk_unique_var("$distributed_g_var"), loc)
         self._g_dist_var = g_dist_var
@@ -163,34 +168,47 @@ class DistributedPass(object):
         out += [size_attr_assign, size_assign]
         first_block.body = out+first_block.body
 
-    def _run_call(self, assign):
+    def _run_call(self, assign, block_body):
         lhs = assign.target.name
         rhs = assign.value
         func_var = rhs.func.name
-        out = []
+        scope = assign.target.scope
+        loc = assign.target.loc
+        out = [assign]
         # divide 1D alloc
         if self._is_1D_arr(lhs) and self._is_alloc_call(func_var):
             size_var = rhs.args[0]
-            scope = assign.target.scope
-            loc = assign.target.loc
             out, start_var, end_var = self._gen_1D_div(size_var, scope, loc,
                 "$alloc", "get_node_portion", get_node_portion)
-            self._array_starts[lhs] = start_var
-            self._array_counts[lhs] = end_var
+            self._array_starts[lhs] = [start_var]
+            self._array_counts[lhs] = [end_var]
             rhs.args[0] = end_var
             out.append(assign)
-            return out
 
-        if self._is_h5_read_call(func_var) and self._is_1D_arr(rhs.args[4].name):
-            arr = rhs.args[4].name
-            rhs.args += [self._array_starts[arr], self._array_counts[arr]]
-            # adjust call type
-            old_arg_typs = list(self.calltypes[rhs].args)
-            self.calltypes.pop(rhs)
-            self.calltypes[rhs] = self.typemap[func_var].get_call_type(
-                typing.Context(), old_arg_typs+[types.int64, types.int64], {})
+        if self._is_h5_read_call(func_var) and self._is_1D_arr(rhs.args[6].name):
+            arr = rhs.args[6].name
+            ndims = len(self._array_starts[arr])
+            starts_var = ir.Var(scope, mk_unique_var("$h5_starts"), loc)
+            self.typemap[starts_var.name] = types.containers.UniTuple(types.int64, ndims)
+            start_tuple_call = ir.Expr.build_tuple(self._array_starts[arr], loc)
+            starts_assign = ir.Assign(start_tuple_call, starts_var, loc)
+            rhs.args[3] = starts_var
+            counts_var = ir.Var(scope, mk_unique_var("$h5_counts"), loc)
+            self.typemap[counts_var.name] = types.containers.UniTuple(types.int64, ndims)
+            count_tuple_call = ir.Expr.build_tuple(self._array_counts[arr], loc)
+            counts_assign = ir.Assign(count_tuple_call, counts_var, loc)
+            out = [starts_assign, counts_assign, assign]
+            rhs.args[4] = counts_var
+            rhs.args[5] = self._set1_var
+            # set parallel arg in file open
+            file_var = rhs.args[0].name
+            for stmt in block_body:
+                if isinstance(stmt, ir.Assign) and stmt.target.name==file_var:
+                    rhs = stmt.value
+                    assert isinstance(rhs, ir.Expr)
+                    rhs.args[2] = self._set1_var
 
-        return [assign]
+        return out
 
     def _run_getitem(self, assign):
         lhs = assign.target.name
@@ -201,7 +219,7 @@ class DistributedPass(object):
         if self._is_1D_arr(arr):
             scope = index_var.scope
             loc = index_var.loc
-            sub_assign = self._get_ind_sub(index_var, self._array_starts[arr])
+            sub_assign = self._get_ind_sub(index_var, self._array_starts[arr][0])
             rhs.index = sub_assign.target
             return [sub_assign, assign]
 
@@ -214,7 +232,7 @@ class DistributedPass(object):
         if self._is_1D_arr(arr):
             scope = index_var.scope
             loc = index_var.loc
-            sub_assign = self._get_ind_sub(index_var, self._array_starts[arr])
+            sub_assign = self._get_ind_sub(index_var, self._array_starts[arr][0])
             stmt.index = sub_assign.target
             return [sub_assign, stmt]
 

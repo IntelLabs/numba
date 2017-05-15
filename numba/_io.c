@@ -1,14 +1,16 @@
+#include "mpi.h"
 #include "hdf5.h"
 
 NUMBA_EXPORT_FUNC(int)
-numba_h5_open(char* file_name, char* mode)
+numba_h5_open(char* file_name, char* mode, int64_t is_parallel)
 {
     // printf("h5_open file_name: %s mode:%s\n", file_name, mode);
     hid_t plist_id = H5Pcreate(H5P_FILE_ACCESS);
     assert(plist_id != -1);
     herr_t ret;
     hid_t file_id;
-    ret = H5Pset_fapl_mpio(plist_id, MPI_COMM_WORLD, MPI_INFO_NULL);
+    if(is_parallel)
+        ret = H5Pset_fapl_mpio(plist_id, MPI_COMM_WORLD, MPI_INFO_NULL);
     assert(ret != -1);
     file_id = H5Fopen((const char*)file_name, H5F_ACC_RDONLY, plist_id);
     assert(file_id != -1);
@@ -33,10 +35,10 @@ numba_h5_size(hid_t file_id, char* dset_name, int dim)
 }
 
 NUMBA_EXPORT_FUNC(int)
-numba_h5_read(hid_t file_id, char* dset_name, int ndims, int64_t* sizes,
-    void* out, int typ_enum, int64_t start_ind, int64_t end_ind)
+numba_h5_read(hid_t file_id, char* dset_name, int ndims, int64_t* starts,
+    int64_t* counts, int64_t is_parallel, void* out, int typ_enum)
 {
-    //printf("dset_name:%s ndims:%d size:%d typ:%d\n", dset_name, ndims, sizes[0], typ_enum);
+    //printf("dset_name:%s ndims:%d size:%d typ:%d\n", dset_name, ndims, counts[0], typ_enum);
     // fflush(stdout);
     // printf("start %lld end %lld\n", start_ind, end_ind);
     int i;
@@ -47,16 +49,12 @@ numba_h5_read(hid_t file_id, char* dset_name, int ndims, int64_t* sizes,
     hid_t space_id = H5Dget_space(dataset_id);
     assert(space_id != -1);
 
-    hsize_t HDF5_start[ndims];
-    for(i=0; i<ndims; i++)
-        HDF5_start[i] = 0;
-    hsize_t* HDF5_count = (hsize_t*)sizes;
+    hsize_t* HDF5_start = (hsize_t*)starts;
+    hsize_t* HDF5_count = (hsize_t*)counts;
 
     hid_t xfer_plist_id = H5P_DEFAULT;
-    if(1)// start_ind!=-1)
+    if(is_parallel)
     {
-        HDF5_start[0] = start_ind;
-        HDF5_count[0] = end_ind;
         xfer_plist_id = H5Pcreate(H5P_DATASET_XFER);
         H5Pset_dxpl_mpio(xfer_plist_id, H5FD_MPIO_COLLECTIVE);
     }
