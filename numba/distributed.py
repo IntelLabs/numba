@@ -8,7 +8,7 @@ from numba import ir, analysis, types, typing, config, numpy_support, cgutils
 from numba.ir_utils import (mk_unique_var, replace_vars_inner, find_topo_order,
                             dprint_func_ir, remove_dead, mk_alloc,
                             get_global_func_typ, find_op_typ, get_name_var_table,
-                            get_call_table)
+                            get_call_table, get_tuple_table)
 
 from numba.parfor import get_parfor_reductions, wrap_parfor_blocks, unwrap_parfor_blocks
 from numba.targets.imputils import lower_builtin
@@ -34,6 +34,7 @@ class DistributedPass(object):
         self.typemap = typemap
         self.calltypes = calltypes
         self._call_table,_ = get_call_table(func_ir.blocks)
+        self._tuple_table = get_tuple_table(func_ir.blocks)
         self._rank_var = None # will be set in run
         self._size_var = None
         self._dist_analysis = None
