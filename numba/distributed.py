@@ -124,8 +124,8 @@ class DistributedPass(object):
         topo_order = find_topo_order(self.func_ir.blocks)
         first_block = self.func_ir.blocks[topo_order[0]]
         # set scope and loc of generated code to the first variable in block
-        scope = first_block.body[0].target.scope
-        loc = first_block.body[0].target.loc
+        scope = first_block.scope
+        loc = first_block.loc
         out = []
         self._set1_var = ir.Var(scope, mk_unique_var("$const_parallel"), loc)
         self.typemap[self._set1_var.name] = types.int64
@@ -280,6 +280,13 @@ class DistributedPass(object):
         return out
 
     def _gen_1D_div(self, size_var, scope, loc, prefix, end_call_name, end_call):
+        div_nodes = []
+        if isinstance(size_var, int):
+            new_size_var = ir.Var(scope, mk_unique_var(prefix+"_size_var"), loc)
+            self.typemap[new_size_var.name] = types.int64
+            size_assign = ir.Assign(ir.Const(size_var, loc), new_size_var, loc)
+            div_nodes.append(size_assign)
+            size_var = new_size_var
         div_var = ir.Var(scope, mk_unique_var(prefix+"_div_var"), loc)
         self.typemap[div_var.name] = types.int64
         div_expr = ir.Expr.binop('//', size_var, self._size_var, loc)
@@ -304,7 +311,7 @@ class DistributedPass(object):
         self.calltypes[end_expr] = self.typemap[end_attr_var.name].get_call_type(
             typing.Context(), [types.int64, types.int64, types.int32, types.int32], {})
         end_assign = ir.Assign(end_expr, end_var, loc)
-        div_nodes = [div_assign, start_assign, end_attr_assign, end_assign]
+        div_nodes += [div_assign, start_assign, end_attr_assign, end_assign]
         return div_nodes, start_var, end_var
 
     def _get_ind_sub(self, ind_var, start_var):
