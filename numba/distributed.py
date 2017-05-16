@@ -2,7 +2,7 @@ from __future__ import print_function, division, absolute_import
 from collections import namedtuple
 
 import types as pytypes # avoid confusion with numba.types
-
+import copy
 import numba
 from numba import ir, analysis, types, typing, config, numpy_support, cgutils
 from numba.ir_utils import (mk_unique_var, replace_vars_inner, find_topo_order,
@@ -40,6 +40,7 @@ class DistributedPass(object):
         self._dist_analysis = None
         self._g_dist_var = None
         self._set1_var = None # variable set to 1
+        self._set0_var = None # variable set to 0
         self._array_starts = {}
         self._array_counts = {}
 
@@ -109,13 +110,15 @@ class DistributedPass(object):
                             new_body += self._run_call(inst, blocks[label].body)
                             continue
                         if rhs.op=='getitem':
-                            new_body += self._run_getitem(inst)
+                            new_body += self._run_getsetitem(rhs.value.name,
+                                rhs.index, rhs, inst)
                             continue
                     if isinstance(rhs, ir.Var) and self._is_1D_arr(rhs.name):
                         self._array_starts[lhs] = self._array_starts[rhs.name]
                         self._array_counts[lhs] = self._array_counts[rhs.name]
                 if isinstance(inst, ir.SetItem):
-                    new_body += self._run_setitem(inst)
+                    new_body += self._run_getsetitem(inst.target.name,
+                        inst.index, inst, inst)
                     continue
                 new_body.append(inst)
             blocks[label].body = new_body
@@ -132,6 +135,10 @@ class DistributedPass(object):
         self.typemap[self._set1_var.name] = types.int64
         set1_assign = ir.Assign(ir.Const(1, loc), self._set1_var, loc)
         out.append(set1_assign)
+        self._set0_var = ir.Var(scope, mk_unique_var("$const_parallel"), loc)
+        self.typemap[self._set0_var.name] = types.int64
+        set0_assign = ir.Assign(ir.Const(0, loc), self._set0_var, loc)
+        out.append(set0_assign)
         # g_dist_var = Global(numba.distributed)
         g_dist_var = ir.Var(scope, mk_unique_var("$distributed_g_var"), loc)
         self._g_dist_var = g_dist_var
@@ -179,11 +186,30 @@ class DistributedPass(object):
         # divide 1D alloc
         if self._is_1D_arr(lhs) and self._is_alloc_call(func_var):
             size_var = rhs.args[0]
-            out, start_var, end_var = self._gen_1D_div(size_var, scope, loc,
-                "$alloc", "get_node_portion", get_node_portion)
-            self._array_starts[lhs] = [start_var]
-            self._array_counts[lhs] = [end_var]
-            rhs.args[0] = end_var
+            if self.typemap[size_var.name]==types.intp:
+                out, start_var, end_var = self._gen_1D_div(size_var, scope, loc,
+                    "$alloc", "get_node_portion", get_node_portion)
+                self._array_starts[lhs] = [start_var]
+                self._array_counts[lhs] = [end_var]
+                rhs.args[0] = end_var
+            else:
+                # size should be either int or tuple of ints
+                assert size_var.name in self._tuple_table
+                size_list = self._tuple_table[size_var.name]
+                out, start_var, end_var = self._gen_1D_div(size_list[0], scope, loc,
+                    "$alloc", "get_node_portion", get_node_portion)
+                ndims = len(size_list)
+                new_size_list = copy.copy(size_list)
+                new_size_list[0] = end_var
+                tuple_var = ir.Var(scope, mk_unique_var("$tuple_var"), loc)
+                self.typemap[tuple_var.name] = self.typemap[size_var.name]
+                tuple_call = ir.Expr.build_tuple(new_size_list, loc)
+                tuple_assign = ir.Assign(tuple_call, tuple_var, loc)
+                out.append(tuple_assign)
+                rhs.args[0] = tuple_var
+                self._array_starts[lhs] = [self._set0_var]*ndims
+                self._array_starts[lhs][0] = start_var
+                self._array_counts[lhs] = new_size_list
             out.append(assign)
 
         if self._is_h5_read_call(func_var) and self._is_1D_arr(rhs.args[6].name):
@@ -211,33 +237,33 @@ class DistributedPass(object):
 
         return out
 
-    def _run_getitem(self, assign):
-        lhs = assign.target.name
-        rhs = assign.value
-        arr = rhs.value.name
-        index_var = rhs.index
-
+    def _run_getsetitem(self, arr, index_var, node, full_node):
+        out = [full_node]
         if self._is_1D_arr(arr):
             scope = index_var.scope
             loc = index_var.loc
-            sub_assign = self._get_ind_sub(index_var, self._array_starts[arr][0])
-            rhs.index = sub_assign.target
-            return [sub_assign, assign]
+            ndims = self.typemap[arr].ndim
+            if ndims==1:
+                sub_assign = self._get_ind_sub(index_var, self._array_starts[arr][0])
+                out = [sub_assign]
+                node.index = sub_assign.target
+            else:
+                assert index_var.name in self._tuple_table
+                index_list = self._tuple_table[index_var.name]
+                sub_assign = self._get_ind_sub(index_list[0], self._array_starts[arr][0])
+                out = [sub_assign]
+                new_index_list = copy.copy(index_list)
+                new_index_list[0] = sub_assign.target
+                tuple_var = ir.Var(scope, mk_unique_var("$tuple_var"), loc)
+                self.typemap[tuple_var.name] = self.typemap[index_var.name]
+                tuple_call = ir.Expr.build_tuple(new_index_list, loc)
+                tuple_assign = ir.Assign(tuple_call, tuple_var, loc)
+                out.append(tuple_assign)
+                node.index = tuple_var
 
-        return [assign]
+            out.append(full_node)
 
-    def _run_setitem(self, stmt):
-        arr = stmt.target.name
-        index_var = stmt.index
-
-        if self._is_1D_arr(arr):
-            scope = index_var.scope
-            loc = index_var.loc
-            sub_assign = self._get_ind_sub(index_var, self._array_starts[arr][0])
-            stmt.index = sub_assign.target
-            return [sub_assign, stmt]
-
-        return [stmt]
+        return out
 
     def _run_parfor(self, parfor, namevar_table):
         # run dist pass recursively
