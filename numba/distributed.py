@@ -66,6 +66,8 @@ class DistributedPass(object):
                         self._analyze_assign(inst, array_dists, parfor_dists)
                     elif isinstance(inst, Parfor):
                         self._analyze_parfor(inst, array_dists, parfor_dists)
+                    else:
+                        self._set_REP(inst.list_vars(), array_dists)
             save_array_dists = array_dists
             save_parfor_dists = parfor_dists
 
@@ -74,6 +76,10 @@ class DistributedPass(object):
     def _analyze_assign(self, inst, array_dists, parfor_dists):
         lhs = inst.target.name
         rhs = inst.value
+        # treat return casts like assignments
+        if isinstance(rhs, ir.Expr) and rhs.op=='cast':
+            rhs = rhs.value
+
         if self._isarray(lhs) and lhs not in array_dists:
             array_dists[lhs] = Distribution.OneD
 
@@ -81,6 +87,8 @@ class DistributedPass(object):
             new_dist = min(array_dists[lhs].value, array_dists[rhs.name].value)
             array_dists[lhs] = Distribution(new_dist)
             array_dists[rhs.name] = Distribution(new_dist)
+        else:
+            pass
         return
 
     def _analyze_parfor(self, parfor, array_dists, parfor_dists):
@@ -91,6 +99,12 @@ class DistributedPass(object):
         self._analyze_dist(blocks, array_dists, parfor_dists)
         unwrap_parfor_blocks(parfor)
         return
+
+    def _set_REP(self, var_list, array_dists):
+        for var in var_list:
+            varname = var.name
+            if self._isarray(varname):
+                array_dists[varname] = Distribution.REP
 
     def _run_dist_pass(self, blocks):
         topo_order = find_topo_order(blocks)
