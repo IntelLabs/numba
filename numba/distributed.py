@@ -4,7 +4,8 @@ from collections import namedtuple
 import types as pytypes # avoid confusion with numba.types
 import copy
 import numba
-from numba import ir, analysis, types, typing, config, numpy_support, cgutils
+from numba import (ir, analysis, types, typing, config, numpy_support, cgutils,
+                    ir_utils)
 from numba.ir_utils import (mk_unique_var, replace_vars_inner, find_topo_order,
                             dprint_func_ir, remove_dead, mk_alloc,
                             get_global_func_typ, find_op_typ, get_name_var_table,
@@ -43,6 +44,7 @@ class DistributedPass(object):
         self._set0_var = None # variable set to 0
         self._array_starts = {}
         self._array_counts = {}
+        self._parallel_accesses = set()
 
     def run(self):
         dprint_func_ir(self.func_ir, "starting distributed pass")
@@ -51,6 +53,7 @@ class DistributedPass(object):
             print("distributions: ", self._dist_analysis)
         self._gen_dist_inits()
         self._run_dist_pass(self.func_ir.blocks)
+        remove_dead(self.func_ir.blocks, self.func_ir.arg_names)
         dprint_func_ir(self.func_ir, "after distributed pass")
         lower_parfor_sequential(self.func_ir, self.typemap, self.calltypes)
 
@@ -60,18 +63,25 @@ class DistributedPass(object):
         save_parfor_dists = {1:1} # dummy value
         # fixed-point iteration
         while array_dists!=save_array_dists or parfor_dists!=save_parfor_dists:
+            save_array_dists = copy.copy(array_dists)
+            save_parfor_dists = copy.copy(parfor_dists)
             for label in topo_order:
-                for inst in blocks[label].body:
-                    if isinstance(inst, ir.Assign):
-                        self._analyze_assign(inst, array_dists, parfor_dists)
-                    elif isinstance(inst, Parfor):
-                        self._analyze_parfor(inst, array_dists, parfor_dists)
-                    else:
-                        self._set_REP(inst.list_vars(), array_dists)
-            save_array_dists = array_dists
-            save_parfor_dists = parfor_dists
+                self._analyze_block(blocks[label], array_dists, parfor_dists)
 
         return _dist_analysis_result(array_dists=array_dists, parfor_dists=parfor_dists)
+
+    def _analyze_block(self, block, array_dists, parfor_dists):
+        for inst in block.body:
+            if isinstance(inst, ir.Assign):
+                self._analyze_assign(inst, array_dists, parfor_dists)
+            elif isinstance(inst, Parfor):
+                self._analyze_parfor(inst, array_dists, parfor_dists)
+            elif (isinstance(inst, ir.SetItem)
+                    and (inst.target.name,inst.index.name)
+                    in self._parallel_accesses):
+                pass # parallel access, don't make REP
+            else:
+                self._set_REP(inst.list_vars(), array_dists)
 
     def _analyze_assign(self, inst, array_dists, parfor_dists):
         lhs = inst.target.name
@@ -80,23 +90,61 @@ class DistributedPass(object):
         if isinstance(rhs, ir.Expr) and rhs.op=='cast':
             rhs = rhs.value
 
-        if self._isarray(lhs) and lhs not in array_dists:
-            array_dists[lhs] = Distribution.OneD
-
         if isinstance(rhs, ir.Var) and self._isarray(lhs):
-            new_dist = min(array_dists[lhs].value, array_dists[rhs.name].value)
-            array_dists[lhs] = Distribution(new_dist)
-            array_dists[rhs.name] = Distribution(new_dist)
+            lhs_dist = Distribution.OneD
+            if lhs in array_dists:
+                lhs_dist = array_dists[lhs]
+            new_dist = Distribution(min(lhs_dist.value, array_dists[rhs.name].value))
+            array_dists[lhs] = new_dist
+            array_dists[rhs.name] = new_dist
+            return
+
+        elif (isinstance(rhs, ir.Expr) and rhs.op=='getitem'
+                and (rhs.value.name,rhs.index.name) in self._parallel_accesses):
+            return
+        elif isinstance(rhs, ir.Expr) and rhs.op=='call':
+            pass# TODO: self._analyze_call(lhs, rhs.func.name, rhs.args)
+            if self._isarray(lhs) and lhs not in array_dists:
+                array_dists[lhs] = Distribution.OneD
         else:
-            pass
+            self._set_REP(inst.list_vars(), array_dists)
         return
 
     def _analyze_parfor(self, parfor, array_dists, parfor_dists):
         if parfor.id not in parfor_dists:
             parfor_dists[parfor.id] = Distribution.OneD
+
+        # analyze init block first to see array definitions
+        self._analyze_block(parfor.init_block, array_dists, parfor_dists)
+        out_dist = Distribution.OneD
+
+        parfor_arrs = set() # arrays this parfor accesses in parallel
+        array_accesses = ir_utils.get_array_accesses(parfor.loop_body)
+        par_index_var = parfor.loop_nests[0].index_variable.name
+        for (arr,index) in array_accesses.items():
+            if index==par_index_var:
+                parfor_arrs.add(arr)
+                self._parallel_accesses.add((arr,index))
+            if index in self._tuple_table:
+                index_tuple = [(var.name if isinstance(var, ir.Var) else var)
+                    for var in self._tuple_table[index]]
+                if index_tuple[0]==par_index_var:
+                    parfor_arrs.add(arr)
+                    self._parallel_accesses.add((arr,index))
+                if par_index_var in index_tuple[1:]:
+                    out_dist = Distribution.REP
+            # TODO: check for index dependency
+
+        for arr in parfor_arrs:
+            out_dist = Distribution(min(out_dist.value, array_dists[arr].value))
+        parfor_dists[parfor.id] = out_dist
+        for arr in parfor_arrs:
+            array_dists[arr] = out_dist
+
         # run analysis recursively on parfor body
         blocks = wrap_parfor_blocks(parfor)
-        self._analyze_dist(blocks, array_dists, parfor_dists)
+        for b in blocks.values():
+            self._analyze_block(b, array_dists, parfor_dists)
         unwrap_parfor_blocks(parfor)
         return
 
