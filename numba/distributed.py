@@ -102,6 +102,8 @@ class DistributedPass(object):
         elif (isinstance(rhs, ir.Expr) and rhs.op=='getitem'
                 and (rhs.value.name,rhs.index.name) in self._parallel_accesses):
             return
+        elif isinstance(rhs, ir.Expr) and rhs.op=='getattr' and rhs.attr=='shape':
+            return
         elif isinstance(rhs, ir.Expr) and rhs.op=='call':
             pass# TODO: self._analyze_call(lhs, rhs.func.name, rhs.args)
             if self._isarray(lhs) and lhs not in array_dists:
