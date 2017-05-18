@@ -110,6 +110,7 @@ build_c_helpers_dict(void)
     declmethod(dist_get_end);
     declmethod(dist_get_node_portion);
     declmethod(dist_reduce);
+    declmethod(dist_arr_reduce);
 
     /* PRNG support */
     declmethod(get_py_random_state);

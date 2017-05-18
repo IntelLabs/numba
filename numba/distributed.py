@@ -102,7 +102,10 @@ class DistributedPass(object):
         elif (isinstance(rhs, ir.Expr) and rhs.op=='getitem'
                 and (rhs.value.name,rhs.index.name) in self._parallel_accesses):
             return
-        elif isinstance(rhs, ir.Expr) and rhs.op=='getattr' and rhs.attr=='shape':
+        elif isinstance(rhs, ir.Expr) and rhs.op=='getattr':# and rhs.attr=='shape':
+            # TODO: handle X.T properly
+            if self._isarray(lhs) and lhs not in array_dists:
+                array_dists[lhs] = Distribution.OneD
             return
         elif isinstance(rhs, ir.Expr) and rhs.op=='call':
             pass# TODO: self._analyze_call(lhs, rhs.func.name, rhs.args)
@@ -298,6 +301,22 @@ class DistributedPass(object):
                     rhs = stmt.value
                     assert isinstance(rhs, ir.Expr)
                     rhs.args[2] = self._set1_var
+        if self._is_call(func_var, ['dot',np]):
+            # reduction across dataset
+            if self._is_1D_arr(rhs.args[0].name) and self._is_1D_arr(rhs.args[1].name):
+                reduce_attr_var = ir.Var(scope, mk_unique_var("$reduce_attr"), loc)
+                reduce_attr_call = ir.Expr.getattr(self._g_dist_var, "dist_arr_reduce", loc)
+                self.typemap[reduce_attr_var.name] = get_global_func_typ(dist_arr_reduce)
+                reduce_assign = ir.Assign(reduce_attr_call, reduce_attr_var, loc)
+                out.append(reduce_assign)
+                err_var = ir.Var(scope, mk_unique_var("$reduce_err_var"), loc)
+                self.typemap[err_var.name] = types.int32
+                reduce_var = assign.target
+                reduce_call = ir.Expr.call(reduce_attr_var, [reduce_var], (), loc)
+                self.calltypes[reduce_call] = self.typemap[reduce_attr_var.name].get_call_type(
+                    typing.Context(), [self.typemap[reduce_var.name]], {})
+                reduce_assign = ir.Assign(reduce_call, err_var, loc)
+                out.append(reduce_assign)
 
         return out
 
@@ -430,6 +449,11 @@ class DistributedPass(object):
             return False
         return self._call_table[func_var]==['h5read', numba.pio]
 
+    def _is_call(self, func_var, call_list):
+        if func_var not in self._call_table:
+            return False
+        return self._call_table[func_var]==call_list
+
 from numba.typing.templates import infer_global, AbstractTemplate
 from numba.typing import signature
 
@@ -452,6 +476,10 @@ def get_node_portion(total_size, div, pes, rank):
 def dist_reduce(value):
     """dummy to implement simple reductions"""
     return value
+
+def dist_arr_reduce(arr):
+    """dummy to implement array reductions"""
+    return -1
 
 @infer_global(get_rank)
 class DistRank(AbstractTemplate):
@@ -487,6 +515,13 @@ class DistReduce(AbstractTemplate):
         assert not kws
         assert len(args)==1
         return signature(args[0], *args)
+
+@infer_global(dist_arr_reduce)
+class DistArrReduce(AbstractTemplate):
+    def generic(self, args, kws):
+        assert not kws
+        assert len(args)==1
+        return signature(types.int32, *args)
 
 from llvmlite import ir as lir
 
@@ -525,3 +560,26 @@ def lower_dist_reduce(context, builder, sig, args):
     fnty = lir.FunctionType(ltyp, [ltyp])
     fn = builder.module.get_or_insert_function(fnty, name="numba_dist_reduce")
     return builder.call(fn, [args[0]])
+
+@lower_builtin(dist_arr_reduce, types.npytypes.Array)
+def lower_dist_arr_reduce(context, builder, sig, args):
+    # store an int to specify data type
+    typ_enum = numba.pio._h5_typ_table[sig.args[0].dtype]
+    typ_arg = cgutils.alloca_once_value(builder, lir.Constant(lir.IntType(32), typ_enum))
+    ndims = sig.args[0].ndim
+    out = make_array(sig.args[0])(context, builder, args[0])
+    # TODO: handle multi-dimensional arrays properly
+    #size_arg = builder.alloca(lir.IntType(64))
+    size_arg = builder.load(out.shape.value.operands[0])
+    for i in range(1,ndims):
+        size_arg = builder.mul(size_arg, out.shape.value.operands[i])
+    ndim_arg = cgutils.alloca_once_value(builder, lir.Constant(lir.IntType(32), sig.args[0].ndim))
+    call_args = [builder.bitcast(out.data, lir.IntType(8).as_pointer()),
+                size_arg, builder.load(ndim_arg), builder.load(typ_arg)]
+
+    # array, shape, ndim, extra last arg type for type enum
+    arg_typs = [lir.IntType(8).as_pointer(), lir.IntType(64),
+        lir.IntType(32), lir.IntType(32)]
+    fnty = lir.FunctionType(lir.IntType(32), arg_typs)
+    fn = builder.module.get_or_insert_function(fnty, name="numba_dist_arr_reduce")
+    return builder.call(fn, call_args)
