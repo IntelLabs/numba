@@ -36,6 +36,16 @@ numba_dist_get_node_portion(int64_t total, int64_t div_chunk, int num_pes, int n
 }
 
 NUMBA_EXPORT_FUNC(double)
+numba_dist_get_time()
+{
+    double wtime;
+    MPI_Barrier(MPI_COMM_WORLD);
+    wtime = MPI_Wtime();
+    return wtime;
+}
+
+
+NUMBA_EXPORT_FUNC(double)
 numba_dist_reduce(double value)
 {
     // printf("sum value: %lf\n", value);

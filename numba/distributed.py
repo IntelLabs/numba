@@ -18,6 +18,7 @@ from numba.parfor import Parfor, lower_parfor_sequential
 import numpy as np
 
 import h5py
+import time
 # from mpi4py import MPI
 
 from enum import Enum
@@ -523,6 +524,13 @@ class DistArrReduce(AbstractTemplate):
         assert len(args)==1
         return signature(types.int32, *args)
 
+@infer_global(time.time)
+class DistTime(AbstractTemplate):
+    def generic(self, args, kws):
+        assert not kws
+        assert len(args)==0
+        return signature(types.float64, *args)
+
 from llvmlite import ir as lir
 
 @lower_builtin(get_rank)
@@ -583,3 +591,9 @@ def lower_dist_arr_reduce(context, builder, sig, args):
     fnty = lir.FunctionType(lir.IntType(32), arg_typs)
     fn = builder.module.get_or_insert_function(fnty, name="numba_dist_arr_reduce")
     return builder.call(fn, call_args)
+
+@lower_builtin(time.time)
+def dist_get_time(context, builder, sig, args):
+    fnty = lir.FunctionType(lir.DoubleType(), [])
+    fn = builder.module.get_or_insert_function(fnty, name="numba_dist_get_time")
+    return builder.call(fn, [])

@@ -11,8 +11,11 @@ def logistic_regression(iterations):
     Y = f['responses'][:]
     D = X.shape[1]
     w = 2.0*np.ones(D)-1.3
+    t1 = time.time()
     for i in range(iterations):
         w -= np.dot(((1.0 / (1.0 + np.exp(-Y * np.dot(X,w))) - 1.0) * Y),X)
+    t2 = time.time()
+    print("exec time:",t2-t1)
     return w
 
 def main():
