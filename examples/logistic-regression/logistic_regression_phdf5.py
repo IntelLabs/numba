@@ -15,7 +15,9 @@ def logistic_regression(iterations):
     for i in range(iterations):
         w -= np.dot(((1.0 / (1.0 + np.exp(-Y * np.dot(X,w))) - 1.0) * Y),X)
     t2 = time.time()
-    print("exec time:",t2-t1)
+    print("Execution time:", t2-t1,"\nresult:")
+    for i in range(D):
+        print(w[i]," ")
     return w
 
 def main():
@@ -27,11 +29,7 @@ def main():
     file_name = args.file
     iterations = args.iterations
 
-    t = time.time()
     w = logistic_regression(iterations)
-    selftimed = time.time()-t
-    print("SELFTIMED ", selftimed)
-    print("result: ", w)
 
 if __name__ == '__main__':
     main()

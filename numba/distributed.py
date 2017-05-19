@@ -55,6 +55,7 @@ class DistributedPass(object):
         self._gen_dist_inits()
         self._run_dist_pass(self.func_ir.blocks)
         remove_dead(self.func_ir.blocks, self.func_ir.arg_names)
+        self.func_ir.blocks = self._dist_prints(self.func_ir.blocks)
         dprint_func_ir(self.func_ir, "after distributed pass")
         lower_parfor_sequential(self.func_ir, self.typemap, self.calltypes)
 
@@ -433,6 +434,41 @@ class DistributedPass(object):
         sub_assign = ir.Assign(sub_expr, sub_var, ind_var.loc)
         return sub_assign
 
+    def _dist_prints(self, blocks):
+        new_blocks = {}
+        for (block_label, block) in blocks.items():
+            scope = block.scope
+            i = _find_first_print(block.body)
+            while i!=-1:
+                inst = block.body[i]
+                loc = inst.loc
+                # split block across print
+                prev_block = ir.Block(scope, loc)
+                new_blocks[block_label] = prev_block
+                block_label = ir_utils.next_label()
+                print_label = ir_utils.next_label()
+
+                prev_block.body = block.body[:i]
+                rank_comp_var = ir.Var(scope, mk_unique_var("$rank_comp"), loc)
+                self.typemap[rank_comp_var.name] = types.boolean
+                comp_expr = ir.Expr.binop('==', self._rank_var, self._set0_var, loc)
+                expr_typ = find_op_typ('==',[types.int32, types.int64])
+                self.calltypes[comp_expr] = expr_typ
+                comp_assign = ir.Assign(comp_expr, rank_comp_var, loc)
+                prev_block.body.append(comp_assign)
+                print_branch = ir.Branch(rank_comp_var, print_label, block_label, loc)
+                prev_block.body.append(print_branch)
+
+                print_block = ir.Block(scope, loc)
+                print_block.body.append(inst)
+                print_block.body.append(ir.Jump(block_label, loc))
+                new_blocks[print_label] = print_block
+
+                block.body = block.body[i+1:]
+                i = _find_first_print(block.body)
+            new_blocks[block_label] = block
+        return new_blocks
+
     def _isarray(self, varname):
         return isinstance(self.typemap[varname], types.npytypes.Array)
 
@@ -454,6 +490,14 @@ class DistributedPass(object):
         if func_var not in self._call_table:
             return False
         return self._call_table[func_var]==call_list
+
+
+def _find_first_print(body):
+    for (i, inst) in enumerate(body):
+        if isinstance(inst, ir.Print):
+            return i
+    return -1
+
 
 from numba.typing.templates import infer_global, AbstractTemplate
 from numba.typing import signature
