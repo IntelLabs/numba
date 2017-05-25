@@ -309,7 +309,7 @@ class TestVariousPR2369(TestCase):
 
             def inner(x, kw=7):
                 return x + z + kw
-            return inner
+            return inner(x)
 
         def outer13(x, kw=7):
             """ outer with kwarg no closure"""
@@ -322,7 +322,7 @@ class TestVariousPR2369(TestCase):
 
             def inner(x):
                 return x + z + kw
-            return inner
+            return inner(x)
 
         def outer15(x, kw=7):
             """ outer with kwarg as arg to closure"""
@@ -330,7 +330,7 @@ class TestVariousPR2369(TestCase):
 
             def inner(x, kw):
                 return x + z + kw
-            return inner
+            return inner(x, kw)
 
         def outer16(x):
             """ closure is generator, consumed locally """
