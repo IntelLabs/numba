@@ -17,6 +17,7 @@ from numba import ir
 import math
 
 def test1(sptprice, strike, rate, volatility, timev):
+    # blackscholes example
     logterm = np.log(sptprice / strike)
     powterm = 0.5 * volatility * volatility
     den = volatility * np.sqrt(timev)
@@ -31,9 +32,24 @@ def test1(sptprice, strike, rate, volatility, timev):
     return put
 
 def test2(Y,X,w,iterations):
+    # logistic regression example
     for i in range(iterations):
         w -= np.dot(((1.0 / (1.0 + np.exp(-Y * np.dot(X,w))) - 1.0) * Y),X)
     return w
+
+def kde_example(X):
+    # KDE example
+    b = 0.5
+    points = np.array([-1.0, 2.0, 5.0])
+    N = points.shape[0]
+    n = X.shape[0]
+    exps = 0
+    for i in prange(n):
+        p = X[i]
+        d = (-(p-points)**2)/(2*b**2)
+        m = np.min(d)
+        exps += m-np.log(b*N)+np.log(np.sum(np.exp(d-m)))
+    return exps
 
 def countParfors(func_ir):
     ret_count = 0
@@ -221,6 +237,15 @@ class TestParfors(unittest.TestCase):
             #print(tp.func_ir.dump())
             #print(countParfors(tp.func_ir) == 1)
             self.assertTrue(countParfors(test_ir) == 1)
+
+    def test_kde(self):
+        n = 128
+        X = np.random.ranf(n)
+        cfunc = njit(parallel=True)(kde_example)
+        expected = kde_example(X)
+        output = cfunc(X)
+        np.testing.assert_almost_equal(expected, output, decimal=1)
+        self.assertIn('@do_scheduling', cfunc.inspect_llvm(cfunc.signatures[0]))
 
 if __name__ == "__main__":
     unittest.main()
