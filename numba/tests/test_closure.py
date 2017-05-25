@@ -332,6 +332,24 @@ class TestVariousPR2369(TestCase):
                 return x + z + kw
             return inner
 
+        def outer16(x):
+            """ closure is generator, consumed locally """
+            z = x + 1
+
+            def inner(x):
+                yield x + z
+
+            return list(inner(x))
+
+        def outer17(x):
+            """ closure is generator, returned """
+            z = x + 1
+
+            def inner(x):
+                yield x + z
+
+            return inner(x)
+
         def list1(x):
             """ Test basic list comprehension """
             return [i for i in range(1, len(x) - 1)]
@@ -472,7 +490,8 @@ class TestVariousPR2369(TestCase):
         # closure/inner func cases
         f = [outer1, outer2, outer3, outer4, outer5,
              outer6, outer7, outer8, outer9, outer10,
-             outer11, outer12, outer13, outer14, outer15]
+             outer11, outer12, outer13, outer14, outer15,
+             outer16, outer17]
         for ref in f:
             cfunc = njit(ref)
             var = 10
