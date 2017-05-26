@@ -19,7 +19,7 @@ import itertools
 from pprint import pprint
 import traceback
 
-from numba import ir, types, utils, config, six, typing, parfor
+from numba import ir, types, utils, config, six, typing
 from .errors import TypingError, UntypedAttributeError, new_error_context
 from .funcdesc import qualifying_prefix
 
