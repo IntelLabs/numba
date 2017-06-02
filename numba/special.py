@@ -16,4 +16,8 @@ class prange(object):
     def __new__(cls, *args):
         return range(*args)
 
-__all__ = ['typeof', 'prange', 'pndindex']
+def set_user_pipeline_func(func):
+    from .compiler import set_user_pipeline_func
+    set_user_pipeline_func(func)
+
+__all__ = ['typeof', 'prange', 'pndindex', 'set_user_pipeline_func']
