@@ -11,7 +11,8 @@ from numba.ir_utils import (mk_unique_var, replace_vars_inner, find_topo_order,
                             get_global_func_typ, find_op_typ, get_name_var_table,
                             get_call_table, get_tuple_table)
 
-from numba.parfor import get_parfor_reductions, wrap_parfor_blocks, unwrap_parfor_blocks
+from numba.parfor import (get_parfor_reductions, get_parfor_params,
+                            wrap_parfor_blocks, unwrap_parfor_blocks)
 from numba.targets.imputils import lower_builtin
 from numba.targets.arrayobj import make_array
 from numba.parfor import Parfor, lower_parfor_sequential
@@ -372,7 +373,8 @@ class DistributedPass(object):
         # self.calltypes[print_node] = signature(types.none, types.int64, types.int64, types.int64)
         # out.append(print_node)
         out.append(parfor)
-        _, reductions = get_parfor_reductions(parfor)
+        parfor_params = get_parfor_params(parfor, self.func_ir)
+        _, reductions = get_parfor_reductions(parfor, parfor_params)
 
         if len(reductions)!=0:
             reduce_attr_var = ir.Var(scope, mk_unique_var("$reduce_attr"), loc)
