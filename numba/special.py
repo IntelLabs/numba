@@ -4,4 +4,8 @@ from .typing.typeof import typeof
 from .parfor import prange
 from .stencilparfor import stencil
 
-__all__ = ['typeof','prange','stencil']
+def set_user_pipeline_func(func):
+    from .compiler import set_user_pipeline_func
+    set_user_pipeline_func(func)
+
+__all__ = ['typeof','prange','set_user_pipeline_func','stencil']
