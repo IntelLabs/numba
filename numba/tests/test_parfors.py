@@ -284,7 +284,7 @@ class TestParfors(TestParforsBase):
         This test is in place until issues with the 'parallel'
         target on Windows with Python 2.7 / 32 bit hardware are fixed.
         """
-        
+
         with self.assertRaises(RuntimeError) as raised:
             @njit(parallel=True)
             def ddot(a, v):
@@ -434,6 +434,23 @@ class TestParfors(TestParforsBase):
             return 4 * np.sum(x**2 + y**2 < 1) / 10
         self.check(test_impl, *self.simple_args)
 
+    @skip_unsupported
+    def test_randoms(self):
+        def test_impl(n):
+            A = np.random.standard_normal(size=(n, n))
+            B = np.random.randn(n, n)
+            C = np.random.normal(0.0, 1.0, (n, n))
+            D = np.random.chisquare(1.0, (n, n))
+            E = np.random.randint(1, high=3, size=(n, n))
+            F = np.random.triangular(1, 2, 3, (n, n))
+            return np.sum(A+B+C+D+E+F)
+
+        n = 128
+        # only run parallel version and don't compare results since random
+        # numbers generated in parallel are different
+        cpfunc = self.compile_parallel(test_impl, (numba.typeof(n),))
+        parfor_output = cpfunc.entry_point(n)
+        self.assertIn('@do_scheduling', cpfunc.library.get_llvm_str())
 
 class TestPrange(TestParforsBase):
 
