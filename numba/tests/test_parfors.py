@@ -262,7 +262,8 @@ class TestParfors(TestParforsBase):
                 'after-inference', tp, tp.func_ir)
 
             parfor_pass = numba.parfor.ParforPass(
-                tp.func_ir, tp.typemap, tp.calltypes, tp.return_type)
+                tp.func_ir, tp.typemap, tp.calltypes, tp.return_type,
+                tp.typingctx)
             parfor_pass.run()
             self.assertTrue(countParfors(test_ir) == 1)
 
@@ -300,7 +301,8 @@ class TestParfors(TestParforsBase):
                 'after-inference', tp, tp.func_ir)
 
             parfor_pass = numba.parfor.ParforPass(
-                tp.func_ir, tp.typemap, tp.calltypes, tp.return_type)
+                tp.func_ir, tp.typemap, tp.calltypes, tp.return_type,
+                tp.typingctx)
             parfor_pass.run()
             self.assertTrue(countParfors(test_ir) == 1)
 
