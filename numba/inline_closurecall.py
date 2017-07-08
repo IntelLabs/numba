@@ -42,8 +42,7 @@ class InlineClosureCallPass(object):
         debug_print("START")
         while work_list:
             label, block = work_list.pop()
-            for i in range(len(block.body)):
-                instr = block.body[i]
+            for i, instr in enumerate(block.body):
                 if isinstance(instr, ir.Assign):
                     lhs = instr.target
                     expr = instr.value
@@ -754,4 +753,3 @@ def _fix_nested_array(func_ir):
 def _new_definition(func_ir, var, value, loc):
     func_ir._definitions[var.name] = [value]
     return ir.Assign(value=value, target=var, loc=loc)
-
