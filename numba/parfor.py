@@ -18,6 +18,8 @@ import sys
 
 from numba import ir, ir_utils, types, typing, rewrites, config, analysis
 from numba import array_analysis, postproc, typeinfer
+from numba import stencilparfor
+from numba.stencilparfor import StencilPass
 
 from numba.ir_utils import (
     mk_unique_var,
@@ -199,6 +201,9 @@ class ParforPass(object):
         canonicalize_array_math(self.func_ir.blocks, self.typemap,
                                 self.calltypes, self.typingctx)
         self.array_analysis.run()
+        stencil_pass = StencilPass(self.func_ir, self.typemap, self.calltypes,
+                                                        self.array_analysis)
+        stencil_pass.run()
         self._convert_prange(self.func_ir.blocks)
         self._convert_numpy(self.func_ir.blocks)
 
@@ -1889,10 +1894,20 @@ ir_utils.array_accesses_extensions[Parfor] = get_parfor_array_accesses
 
 
 def parfor_add_offset_to_labels(parfor, offset):
+    #print("parfor_add_offset_to_labels")
+    #parfor.dump()
     blocks = wrap_parfor_blocks(parfor)
+    #print("Pre work dump")
+    #for offset, block in sorted(blocks.items()):
+    #    print("offset = ", offset)
+    #    block.dump()
     blocks = ir_utils.add_offset_to_labels(blocks, offset)
     blocks[0] = blocks[offset]
     blocks.pop(offset)
+    #print("Post work dump")
+    #for offset, block in sorted(blocks.items()):
+    #    print("offset = ", offset)
+    #    block.dump()
     unwrap_parfor_blocks(parfor, blocks)
     return
 
