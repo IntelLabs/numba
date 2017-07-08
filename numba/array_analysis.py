@@ -6,6 +6,7 @@
 from __future__ import print_function, division, absolute_import
 import types as pytypes  # avoid confusion with numba.types
 import numpy
+import numba
 from numba import ir, analysis, types, config
 from numba.ir_utils import (mk_unique_var, replace_vars_inner, find_topo_order,
                             dprint_func_ir)
@@ -80,6 +81,9 @@ class ArrayAnalysis(object):
         self.tuple_table = {}
         self.list_table = {}
         self.constant_table = {}
+        # save data to identify stencils
+        self.numba_globals = set()
+        self.stencil_calls = set()
 
     def run(self):
         """run array shape analysis on the IR and save information in
@@ -143,6 +147,10 @@ class ArrayAnalysis(object):
                     rhs.value,
                     pytypes.ModuleType) and rhs.value == numpy:
                 self.numpy_globals.append(lhs)
+            if isinstance(
+                    rhs.value,
+                    pytypes.ModuleType) and rhs.value == numba:
+                self.numba_globals.add(lhs)
         if isinstance(rhs, ir.Expr) and rhs.op == 'getattr':
             if rhs.value.name in self.numpy_globals:
                 self.numpy_calls[lhs] = rhs.attr
@@ -153,6 +161,8 @@ class ArrayAnalysis(object):
                                          + '.' + rhs.attr)
             elif self._isarray(rhs.value.name):
                 self.array_attr_calls[lhs] = (rhs.attr, rhs.value)
+            elif rhs.value.name in self.numba_globals and rhs.attr == 'stencil':
+                self.stencil_calls.add(lhs)
         if isinstance(rhs, ir.Expr) and rhs.op == 'build_tuple':
             self.tuple_table[lhs] = rhs.items
         if isinstance(rhs, ir.Expr) and rhs.op == 'build_list':
@@ -263,6 +273,18 @@ class ArrayAnalysis(object):
                     assert self._get_ndims(in2) == 1
                     c1 = self.array_shape_classes[in1][0]
                     c2 = self.array_shape_classes[in2][0]
+                    self._merge_classes(c1, c2)
+            if rhs.func.name in self.stencil_calls:
+                # in_arr, out_arr, stencil_out for now
+                assert len(rhs.args)==3
+                in1 = rhs.args[0].name
+                in2 = rhs.args[1].name
+                assert self._isarray(in1) and self._isarray(in2)
+                # all dimensions should have same size
+                ndims = self._get_ndims(in1)
+                for i in range(ndims):
+                    c1 = self.array_shape_classes[in1][i]
+                    c2 = self.array_shape_classes[in2][i]
                     self._merge_classes(c1, c2)
         return
 
