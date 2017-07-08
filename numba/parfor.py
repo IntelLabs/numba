@@ -18,6 +18,8 @@ import sys
 
 from numba import ir, ir_utils, types, typing, rewrites, config, analysis
 from numba import array_analysis, postproc, typeinfer
+from numba import stencilparfor
+from numba.stencilparfor import StencilPass
 
 from numba.ir_utils import (
     mk_unique_var,
@@ -189,6 +191,9 @@ class ParforPass(object):
         remove_dels(self.func_ir.blocks)
         self.array_analysis.run()
         simplify_CFG(self.func_ir.blocks)
+        stencil_pass = StencilPass(self.func_ir, self.typemap, self.calltypes,
+                                                        self.array_analysis)
+        stencil_pass.run()
         self._convert_prange(self.func_ir.blocks)
         self._convert_numpy(self.func_ir.blocks)
 
