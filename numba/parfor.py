@@ -164,11 +164,12 @@ class ParforPass(object):
     stage.
     """
 
-    def __init__(self, func_ir, typemap, calltypes, return_type):
+    def __init__(self, func_ir, typemap, calltypes, return_type, typingctx):
         self.func_ir = func_ir
         self.typemap = typemap
         self.calltypes = calltypes
         self.return_type = return_type
+        self.typingctx = typingctx
         self.array_analysis = array_analysis.ArrayAnalysis(func_ir, typemap,
                                                            calltypes)
         ir_utils._max_label = max(func_ir.blocks.keys())
@@ -192,7 +193,7 @@ class ParforPass(object):
         self.array_analysis.run()
         simplify_CFG(self.func_ir.blocks)
         stencil_pass = StencilPass(self.func_ir, self.typemap, self.calltypes,
-                                                        self.array_analysis)
+                                            self.array_analysis, self.typingctx)
         stencil_pass.run()
         self._convert_prange(self.func_ir.blocks)
         self._convert_numpy(self.func_ir.blocks)
