@@ -275,8 +275,8 @@ class ArrayAnalysis(object):
                     c2 = self.array_shape_classes[in2][0]
                     self._merge_classes(c1, c2)
             if rhs.func.name in self.stencil_calls:
-                # in_arr, out_arr, stencil_out for now
-                assert len(rhs.args)==3
+                # in_arr, out_arr for now
+                assert len(rhs.args)==2
                 in1 = rhs.args[0].name
                 in2 = rhs.args[1].name
                 assert self._isarray(in1) and self._isarray(in2)
