@@ -14,7 +14,7 @@ import numpy as np
 
 import numba
 from numba import unittest_support as unittest
-from numba import njit, prange
+from numba import njit, prange, stencil
 from numba import compiler, typing
 from numba.targets import cpu
 from numba import types
@@ -205,6 +205,70 @@ class TestParfors(TestParforsBase):
 
     @skip_unsupported
     @tag('important')
+    def test_stencil1(self):
+        def test_impl1(n):
+            A = np.arange(n**2).reshape((n, n))
+            B = np.zeros(n**2).reshape((n, n))
+            numba.stencil(A, B, lambda a: 0.25 * (a[0,1] + a[1,0] + a[0,-1]
+                                                                    + a[-1,0]))
+            return B
+
+        def test_impl2(n):
+            A = np.arange(n**2).reshape((n, n))
+            B = np.zeros(n**2).reshape((n, n))
+            def sf(a):
+                return 0.25 * (a[0,1] + a[1,0] + a[0,-1] + a[-1,0])
+            stencil(A, B, sf)
+            return B
+
+        def test_impl_seq(n):
+            A = np.arange(n**2).reshape((n, n))
+            B = np.zeros(n**2).reshape((n, n))
+            for i in range(1, n-1):
+                for j in range(1, n-1):
+                    B[i,j] = 0.25 * (A[i,j+1] + A[i+1,j] + A[i,j-1] + A[i-1,j])
+            return B
+
+        sig = (types.intp,)
+        cpfunc1 = self.compile_parallel(test_impl1, sig)
+        cpfunc2 = self.compile_parallel(test_impl2, sig)
+        n = 100
+        py_output = test_impl_seq(n)
+        par_output1 = cpfunc1.entry_point(n)
+        par_output2 = cpfunc2.entry_point(n)
+        np.testing.assert_almost_equal(par_output1, py_output, decimal=1)
+        np.testing.assert_almost_equal(par_output2, py_output, decimal=1)
+
+        self.assertIn('@do_scheduling', cpfunc1.library.get_llvm_str())
+        self.assertIn('@do_scheduling', cpfunc2.library.get_llvm_str())
+
+    @skip_unsupported
+    @tag('important')
+    def test_stencil2(self):
+        def test_impl(n):
+            A = np.arange(n)
+            B = np.zeros(n)
+            numba.stencil(A, B, lambda a: 0.3 * (a[-1] + a[0] + a[1]))
+            return B
+
+        def test_impl_seq(n):
+            A = np.arange(n)
+            B = np.zeros(n)
+            for i in range(1, n-1):
+                B[i] = 0.3 * (A[i-1] + A[i] + A[i+1])
+            return B
+
+        sig = (types.intp,)
+        cpfunc = self.compile_parallel(test_impl, sig)
+        n = 100
+        py_output = test_impl_seq(n)
+        par_output = cpfunc.entry_point(n)
+        np.testing.assert_almost_equal(par_output, py_output, decimal=1)
+
+        self.assertIn('@do_scheduling', cpfunc.library.get_llvm_str())
+
+    @skip_unsupported
+    @tag('important')
     def test_test1(self):
         typingctx = typing.Context()
         targetctx = cpu.CPUContext(typingctx)
@@ -235,7 +299,8 @@ class TestParfors(TestParforsBase):
                 'after-inference', tp, tp.func_ir)
 
             parfor_pass = numba.parfor.ParforPass(
-                tp.func_ir, tp.typemap, tp.calltypes, tp.return_type)
+                tp.func_ir, tp.typemap, tp.calltypes, tp.return_type,
+                tp.typingctx)
             parfor_pass.run()
             self.assertTrue(countParfors(test_ir) == 1)
 
@@ -273,7 +338,8 @@ class TestParfors(TestParforsBase):
                 'after-inference', tp, tp.func_ir)
 
             parfor_pass = numba.parfor.ParforPass(
-                tp.func_ir, tp.typemap, tp.calltypes, tp.return_type)
+                tp.func_ir, tp.typemap, tp.calltypes, tp.return_type,
+                tp.typingctx)
             parfor_pass.run()
             self.assertTrue(countParfors(test_ir) == 1)
 
@@ -757,6 +823,39 @@ class TestPrange(TestParforsBase):
         X = np.random.ranf(n)
         self.prange_tester(test_impl, X)
 
+    @skip_unsupported
+    def test_parfor_alias1(self):
+        def test_impl(n):
+            b = np.zeros((n, n))
+            a = b[0]
+            for j in range(n):
+                a[j] = j + 1
+            return b.sum()
+        self.prange_tester(test_impl, 4)
+
+    @skip_unsupported
+    def test_parfor_alias2(self):
+        def test_impl(n):
+            b = np.zeros((n, n))
+            for i in range(n):
+              a = b[i]
+              for j in range(n):
+                a[j] = i + j
+            return b.sum()
+        self.prange_tester(test_impl, 4)
+
+    @skip_unsupported
+    def test_parfor_alias3(self):
+        def test_impl(n):
+            b = np.zeros((n, n, n))
+            for i in range(n):
+              a = b[i]
+              for j in range(n):
+                c = a[j]
+                for k in range(n):
+                  c[k] = i + j + k
+            return b.sum()
+        self.prange_tester(test_impl, 4)
 
 if __name__ == "__main__":
     unittest.main()
