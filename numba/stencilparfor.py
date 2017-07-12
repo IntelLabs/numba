@@ -105,7 +105,7 @@ class StencilPass(object):
             gen_nodes.append(index_assign)
             # start from stencil size to avoid invalid array access
             loopnests.append(numba.parfor.LoopNest(parfor_vars[i],
-                                abs(start_lengths[i]), last_ind, 1, corrs[i]))
+                                abs(start_lengths[i]), last_ind, 1, -1))
 
         # create parfor index var
         if ndims == 1:
