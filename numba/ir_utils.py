@@ -438,6 +438,18 @@ def remove_dels(blocks):
     return
 
 
+def remove_args(blocks):
+    """remove ir.Arg nodes"""
+    for block in blocks.values():
+        new_body = []
+        for stmt in block.body:
+            if isinstance(stmt, ir.Assign) and isinstance(stmt.value, ir.Arg):
+                continue
+            new_body.append(stmt)
+        block.body = new_body
+    return
+
+
 def remove_dead(blocks, args, typemap=None, alias_map=None, arg_aliases=None):
     """dead code elimination using liveness and CFG info.
     Returns True if something has been removed, or False if nothing is removed.
@@ -1119,3 +1131,26 @@ def simplify(func_ir, typemap, array_analysis, calltypes, update_analysis):
     remove_dead(func_ir.blocks, func_ir.arg_names, typemap)
     if config.DEBUG_ARRAY_OPT == 1:
         dprint_func_ir(func_ir, "after simplify")
+
+def gen_np_call(func_as_str, func, lhs, args, typemap, calltypes):
+    scope = args[0].scope
+    loc = args[0].loc
+
+    # g_np_var = Global(numpy)
+    g_np_var = ir.Var(scope, mk_unique_var("$np_g_var"), loc)
+    typemap[g_np_var.name] = types.misc.Module(numpy)
+    g_np = ir.Global('np', np, loc)
+    g_np_assign = ir.Assign(g_np, g_np_var, loc)
+    # attr call: <something>_attr = getattr(g_np_var, func_as_str)
+    np_attr_call = ir.Expr.getattr(g_np_var, func_as_str, loc)
+    attr_var = ir.Var(scope, mk_unique_var("$np_attr_attr"), loc)
+    func_var_typ = get_np_ufunc_typ(func)
+    typemap[attr_var.name] = func_var_typ
+    attr_assign = ir.Assign(np_attr_call, attr_var, loc)
+    # np call: lhs = np_attr(*args)
+    np_call = ir.Expr.call(attr_var, args, (), loc)
+    arg_types = [typemap[x.name] for x in args]
+    func_typ = func_var_typ.get_call_type(typing.Context(), arg_types, {})
+    calltypes[np_call] = func_typ
+    np_assign = ir.Assign(np_call, lhs, loc)
+    return [g_np_assign, attr_assign, np_assign]
