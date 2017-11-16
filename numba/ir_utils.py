@@ -5,7 +5,7 @@
 
 import numba
 import types as pytypes
-from numba import ir, types, typing, config, analysis, utils, cgutils
+from numba import ir, types, typing, config, analysis, utils, cgutils, rewrites
 from numba.typing.templates import signature, infer_global, AbstractTemplate
 from llvmlite import ir as lir
 from numba.targets.imputils import impl_ret_untracked
@@ -350,6 +350,8 @@ def visit_vars_stmt(stmt, callback, cbdata):
         stmt.name = visit_vars_inner(stmt.name, callback, cbdata)
     elif isinstance(stmt, ir.Return):
         stmt.value = visit_vars_inner(stmt.value, callback, cbdata)
+    elif isinstance(stmt, ir.Raise):
+        stmt.exception = visit_vars_inner(stmt.exception, callback, cbdata)
     elif isinstance(stmt, ir.Branch):
         stmt.cond = visit_vars_inner(stmt.cond, callback, cbdata)
     elif isinstance(stmt, ir.Jump):
@@ -1447,6 +1449,20 @@ def get_ir_of_code(glbls, fcode):
     f.__name__ = fcode.co_name
     from numba import compiler
     ir = compiler.run_frontend(f)
+    # we need to run the before inference rewrite pass to normalize the IR
+    # XXX: check rewrite pass flag?
+    # for example, Raise nodes need to become StaticRaise before type inference
+    class DummyPipeline(object):
+        def __init__(self, f_ir):
+            self.typingctx = None
+            self.targetctx = None
+            self.args = None
+            self.func_ir = f_ir
+            self.typemap = None
+            self.return_type = None
+            self.calltypes = None
+    rewrites.rewrite_registry.apply('before-inference',
+                                    DummyPipeline(ir), ir)
     return ir
 
 def replace_arg_nodes(block, args):

@@ -157,7 +157,9 @@ class StencilFunc(object):
                     if stmt.value.op == 'getitem':
                         stmt_index_var = stmt.value.index
                     else:
-                        raise ValueError("Unexpected static_getitem in add_indices_to_kernel.")
+                        stmt_index_var = stmt.value.index_var
+                        # allow static_getitem since rewrite passes are applied
+                        #raise ValueError("Unexpected static_getitem in add_indices_to_kernel.")
 
                     relatively_indexed.add(stmt.value.value.name)
 
@@ -432,7 +434,7 @@ class StencilFunc(object):
         # the index variable for each dimension.  index0, index1, ...
         index_vars = []
         for i in range(the_array.ndim):
-            index_var_name = ir_utils.get_unused_var_name("index" + str(i), 
+            index_var_name = ir_utils.get_unused_var_name("index" + str(i),
                                                           name_var_table)
             index_vars += [index_var_name]
 
@@ -596,7 +598,7 @@ class StencilFunc(object):
         # Search all the block in the stencil outline for the sentinel.
         for label, block in stencil_ir.blocks.items():
             for i, inst in enumerate(block.body):
-                if (isinstance( inst, ir.Assign) and 
+                if (isinstance( inst, ir.Assign) and
                     inst.target.name == sentinel_name):
                     # We found the sentinel assignment.
                     loc = inst.loc
