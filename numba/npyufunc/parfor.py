@@ -8,8 +8,8 @@ from .. import compiler, ir, types, six, cgutils, sigutils, lowering, parfor
 from numba.ir_utils import (add_offset_to_labels, replace_var_names,
                             remove_dels, legalize_names, mk_unique_var,
                             rename_labels, get_name_var_table, visit_vars_inner,
-                            get_definition, guard, find_callname, 
-                            get_call_table, is_pure, 
+                            get_definition, guard, find_callname,
+                            get_call_table, is_pure,
                             get_unused_var_name)
 from numba.analysis import (compute_use_defs, compute_live_map,
                             compute_dead_maps, compute_cfg_from_blocks)
@@ -256,7 +256,7 @@ def hoist(parfor_params, loop_body, typemap, wrapped_blocks):
         new_block = []
         for inst in block.body:
             if isinstance(inst, ir.Assign) and inst.target.name in def_once:
-                if _hoist_internal(inst, dep_on_param, call_table, 
+                if _hoist_internal(inst, dep_on_param, call_table,
                                    hoisted, typemap):
                     # don't add this instuction to the block since it is hoisted
                     continue
@@ -514,7 +514,7 @@ def _create_gufunc_for_parfor_body(
                     strval = "{} =".format(inst.target.name)
                     strconsttyp = types.Const(strval)
 
-                    lhs = scope.make_temp(loc=loc)
+                    lhs = ir.Var(scope, mk_unique_var("str_const"), loc)
                     assign_lhs = ir.Assign(value=ir.Const(value=strval, loc=loc),
                                            target=lhs, loc=loc)
                     typemap[lhs.name] = strconsttyp
