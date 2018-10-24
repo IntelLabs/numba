@@ -4,7 +4,6 @@ import warnings
 import functools
 import locale
 import weakref
-from collections import defaultdict
 import ctypes
 
 import llvmlite.llvmpy.core as lc
@@ -15,6 +14,7 @@ import llvmlite.ir as llvmir
 from numba import config, utils, cgutils
 from numba.runtime.nrtopt import remove_redundant_nrt_refct
 from numba.runtime import rtsys
+from numba.compiler_lock import require_global_compiler_lock
 
 _x86arch = frozenset(['x86', 'i386', 'i486', 'i586', 'i686', 'i786',
                       'i886', 'i986'])
@@ -207,6 +207,8 @@ class CodeLibrary(object):
         Finalization involves various stages of code optimization and
         linking.
         """
+        require_global_compiler_lock()
+
         # Report any LLVM-related problems to the user
         self._codegen._check_llvm_bugs()
 
@@ -583,7 +585,9 @@ class JitEngine(object):
     set_object_cache = _proxy(ll.ExecutionEngine.set_object_cache)
     finalize_object = _proxy(ll.ExecutionEngine.finalize_object)
     get_function_address = _proxy(ll.ExecutionEngine.get_function_address)
-
+    get_global_value_address = _proxy(
+        ll.ExecutionEngine.get_global_value_address
+        )
 
 class BaseCPUCodegen(object):
 
@@ -607,6 +611,9 @@ class BaseCPUCodegen(object):
         self._customize_tm_options(tm_options)
         tm = target.create_target_machine(**tm_options)
         engine = ll.create_mcjit_compiler(llvm_module, tm)
+
+        if config.ENABLE_PROFILING:
+            engine.enable_jit_events()
 
         self._tm = tm
         self._engine = JitEngine(engine)
@@ -803,6 +810,15 @@ class JITCPUCodegen(BaseCPUCodegen):
         #      violation with certain test combinations.
         # # Early bind the engine method to avoid keeping a reference to self.
         # return functools.partial(self._engine.remove_module, module)
+
+    def set_env(self, env_name, env):
+        """Set the environment address.
+
+        Update the GlobalVariable named *env_name* to the address of *env*.
+        """
+        gvaddr = self._engine.get_global_value_address(env_name)
+        envptr = (ctypes.c_void_p * 1).from_address(gvaddr)
+        envptr[0] = ctypes.c_void_p(id(env))
 
 
 def initialize_llvm():

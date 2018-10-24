@@ -9,6 +9,7 @@ import contextlib
 from llvmlite import ir
 
 import numpy as np
+import operator
 
 from numba import types, cgutils
 
@@ -21,6 +22,7 @@ from numba import types
 from numba import numpy_support as np_support
 from .arrayobj import make_array, _empty_nd_impl, array_copy
 from ..errors import TypingError
+from ..utils import HAS_MATMUL_OPERATOR
 
 ll_char = ir.IntType(8)
 ll_char_p = ll_char.as_pointer()
@@ -518,7 +520,6 @@ def dot_2_vv(context, builder, sig, args, conjugate=False):
 
 
 @lower_builtin(np.dot, types.Array, types.Array)
-@lower_builtin('@', types.Array, types.Array)
 def dot_2(context, builder, sig, args):
     """
     np.dot(a, b)
@@ -538,6 +539,9 @@ def dot_2(context, builder, sig, args):
             return dot_2_vv(context, builder, sig, args)
         else:
             assert 0
+
+if HAS_MATMUL_OPERATOR:
+    lower_builtin(operator.matmul, types.Array, types.Array)(dot_2)
 
 
 @lower_builtin(np.vdot, types.Array, types.Array)
@@ -736,14 +740,14 @@ def _check_linalg_matrix(a, func_name, la_prefix=True):
         a = a.type
     if not isinstance(a, types.Array):
         msg = "%s.%s() only supported for array types" % interp
-        raise TypingError(msg)
+        raise TypingError(msg, highlighting=False)
     if not a.ndim == 2:
         msg = "%s.%s() only supported on 2-D arrays." % interp
-        raise TypingError(msg)
+        raise TypingError(msg, highlighting=False)
     if not isinstance(a.dtype, (types.Float, types.Complex)):
         msg = "%s.%s() only supported on "\
             "float and complex arrays." % interp
-        raise TypingError(msg)
+        raise TypingError(msg, highlighting=False)
 
 
 def _check_homogeneous_types(func_name, *types):
@@ -751,7 +755,7 @@ def _check_homogeneous_types(func_name, *types):
     for t in types[1:]:
         if t.dtype != t0:
             msg = "np.linalg.%s() only supports inputs that have homogeneous dtypes." % func_name
-            raise TypingError(msg)
+            raise TypingError(msg, highlighting=False)
 
 
 @register_jitable
@@ -2611,7 +2615,7 @@ def _check_scalar_or_lt_2d_mat(a, func_name, la_prefix=True):
     if isinstance(a, types.Array):
         if not a.ndim <= 2:
             raise TypingError("%s.%s() only supported on 1 and 2-D arrays "
-                              % interp)
+                              % interp, highlighting=False)
 
 
 def _get_as_array(x):

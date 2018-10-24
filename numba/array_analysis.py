@@ -6,6 +6,7 @@
 from __future__ import print_function, division, absolute_import
 import types as pytypes  # avoid confusion with numba.types
 import numpy
+import operator
 from numba import ir, analysis, types, config, cgutils, typing
 from numba.ir_utils import (
     mk_unique_var,
@@ -18,7 +19,8 @@ from numba.ir_utils import (
     get_definition,
     find_callname,
     find_build_sequence,
-    find_const)
+    find_const,
+    is_namedtuple_class)
 from numba.analysis import (compute_cfg_from_blocks)
 from numba.typing import npydecl, signature
 import collections
@@ -493,7 +495,7 @@ class ShapeEquivSet(EquivSet):
         for i in inds:
             require(i in self.ind_to_var)
             vs = self.ind_to_var[i]
-            assert(vs != [])
+            require(vs != [])
             shape.append(vs[0])
         return tuple(shape)
 
@@ -684,7 +686,7 @@ class SymbolicEquivSet(ShapeEquivSet):
                 if expr.op == 'call':
                     fname, mod_name = find_callname(
                             func_ir, expr, typemap=self.typemap)
-                    if fname == 'wrap_index' and mod_name == 'numba.extending':
+                    if fname == 'wrap_index' and mod_name == 'numba.array_analysis':
                         index = tuple(self.obj_to_ind.get(x.name, -1)
                                       for x in expr.args)
                         if -1 in index:
@@ -697,9 +699,9 @@ class SymbolicEquivSet(ShapeEquivSet):
                 elif expr.op == 'binop':
                     lhs = self._get_or_set_rel(expr.lhs, func_ir)
                     rhs = self._get_or_set_rel(expr.rhs, func_ir)
-                    if expr.fn == '+':
+                    if expr.fn == operator.add:
                         value = plus(lhs, rhs)
-                    elif expr.fn == '-':
+                    elif expr.fn == operator.sub:
                         value = minus(lhs, rhs)
             elif isinstance(expr, ir.Const) and isinstance(expr.value, int):
                 value = expr.value
@@ -1037,11 +1039,11 @@ class ArrayAnalysis(object):
                                      list(defvars)[0])
             if isinstance(cond_def, ir.Expr) and cond_def.op == 'binop':
                 br = None
-                if cond_def.fn == '==':
+                if cond_def.fn == operator.eq:
                     br = inst.truebr
                     otherbr = inst.falsebr
                     cond_val = 1
-                elif cond_def.fn == '!=':
+                elif cond_def.fn == operator.ne:
                     br = inst.falsebr
                     otherbr = inst.truebr
                     cond_val = 0
@@ -1172,7 +1174,7 @@ class ArrayAnalysis(object):
                 return dsize
 
             size_var = ir.Var(scope, mk_unique_var("slice_size"), loc)
-            size_val = ir.Expr.binop('-', rhs, lhs, loc=loc)
+            size_val = ir.Expr.binop(operator.sub, rhs, lhs, loc=loc)
             self.calltypes[size_val] = signature(size_typ, lhs_typ, rhs_typ)
             self._define(equiv_set, size_var, size_typ, size_val)
 
@@ -1233,7 +1235,7 @@ class ArrayAnalysis(object):
         require(expr.fn in UNARY_MAP_OP)
         # for scalars, only + operator results in equivalence
         # for example, if "m = -n", m and n are not equivalent
-        if self._isarray(expr.value.name) or expr.fn == '+':
+        if self._isarray(expr.value.name) or expr.fn == operator.add:
             return expr.value, []
         return None
 
@@ -1242,7 +1244,7 @@ class ArrayAnalysis(object):
         return self._analyze_broadcast(scope, equiv_set, expr.loc, [expr.lhs, expr.rhs])
 
     def _analyze_op_inplace_binop(self, scope, equiv_set, expr):
-        require(expr.immutable_fn in BINARY_MAP_OP)
+        require(expr.immutable_fn in INPLACE_BINARY_MAP_OP)
         return self._analyze_broadcast(scope, equiv_set, expr.loc, [expr.lhs, expr.rhs])
 
     def _analyze_op_arrayexpr(self, scope, equiv_set, expr):
@@ -1256,15 +1258,21 @@ class ArrayAnalysis(object):
 
         callee = expr.func
         callee_def = get_definition(self.func_ir, callee)
-        if ((isinstance(callee_def, ir.Global) or isinstance(callee_def, ir.FreeVar))
-            and isinstance(callee_def.value, StencilFunc)):
+        if (isinstance(callee_def, (ir.Global, ir.FreeVar))
+                and is_namedtuple_class(callee_def.value)):
+            return tuple(expr.args), []
+        if (isinstance(callee_def, (ir.Global, ir.FreeVar))
+                and isinstance(callee_def.value, StencilFunc)):
             args = expr.args
             return self._analyze_stencil(scope, equiv_set, callee_def.value,
                                          expr.loc, args, dict(expr.kws))
 
         fname, mod_name = find_callname(
             self.func_ir, expr, typemap=self.typemap)
-        if isinstance(mod_name, ir.Var):  # call via attribute
+        # call via attribute (i.e. array.func)
+        if (isinstance(mod_name, ir.Var)
+                and isinstance(self.typemap[mod_name.name],
+                                types.ArrayCompatible)):
             args = [mod_name] + expr.args
             mod_name = 'numpy'
         else:
@@ -1295,7 +1303,8 @@ class ArrayAnalysis(object):
             return shape[0], [], shape[0]
         return None
 
-    def _analyze_op_call_numba_extending_assert_equiv(self, scope, equiv_set, args, kws):
+    def _analyze_op_call_numba_array_analysis_assert_equiv(self, scope,
+                                                        equiv_set, args, kws):
         equiv_set.insert_equiv(*args[1:])
         return None
 
@@ -1312,8 +1321,8 @@ class ArrayAnalysis(object):
     def _analyze_op_call_numpy_empty(self, scope, equiv_set, args, kws):
         return self._analyze_numpy_create_array(scope, equiv_set, args, kws)
 
-    def _analyze_op_call_numba_extending_empty_inferred(self, scope, equiv_set,
-                                                                    args, kws):
+    def _analyze_op_call_numba_unsafe_ndarray_empty_inferred(self, scope,
+                                                         equiv_set, args, kws):
         return self._analyze_numpy_create_array(scope, equiv_set, args, kws)
 
     def _analyze_op_call_numpy_zeros(self, scope, equiv_set, args, kws):
@@ -1882,6 +1891,7 @@ class ArrayAnalysis(object):
         return s
 
 UNARY_MAP_OP = list(
-    npydecl.NumpyRulesUnaryArrayOperator._op_map.keys()) + ['+']
+    npydecl.NumpyRulesUnaryArrayOperator._op_map.keys()) + [operator.pos]
 BINARY_MAP_OP = npydecl.NumpyRulesArrayOperator._op_map.keys()
+INPLACE_BINARY_MAP_OP = npydecl.NumpyRulesInplaceArrayOperator._op_map.keys()
 UFUNC_MAP_OP = [f.__name__ for f in npydecl.supported_ufuncs]

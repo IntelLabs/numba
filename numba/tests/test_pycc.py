@@ -28,6 +28,9 @@ from numba.pycc.platform import _external_compiler_ok
 _skip_reason = 'AOT compatible compilers missing'
 _skip_missing_compilers = unittest.skipIf(not _external_compiler_ok,
                                           _skip_reason)
+_skip_reason = 'windows only'
+_windows_only = unittest.skipIf(not sys.platform.startswith('win'),
+                                _skip_reason)
 
 from .matmul_usecase import has_blas
 from .support import TestCase, tag, import_dynamic, temp_directory
@@ -42,6 +45,19 @@ def unset_macosx_deployment_target():
     """
     if 'MACOSX_DEPLOYMENT_TARGET' in os.environ:
         del os.environ['MACOSX_DEPLOYMENT_TARGET']
+
+class TestCompilerChecks(TestCase):
+
+    # NOTE: THIS TEST MUST ALWAYS RUN ON WINDOWS, DO NOT SKIP
+    @_windows_only
+    def test_windows_compiler_validity(self):
+        # When inside conda-build VSINSTALLDIR should be set and windows should
+        # have a valid compiler available, `_external_compiler_ok` should  agree
+        # with this. If this is not the case then error out to alert devs.
+        is_running_conda_build = os.environ.get('CONDA_BUILD', None) is not None
+        if is_running_conda_build:
+            if os.environ.get('VSINSTALLDIR', None) is not None:
+                self.assertTrue(_external_compiler_ok)
 
 
 class BasePYCCTest(TestCase):
@@ -87,20 +103,20 @@ class TestLegacyAPI(BasePYCCTest):
 
         main(args=['--debug', '-o', cdll_path, source])
         lib = CDLL(cdll_path)
-        lib.mult.argtypes = [POINTER(c_double), c_void_p, c_void_p,
+        lib.mult.argtypes = [POINTER(c_double), c_void_p,
                              c_double, c_double]
         lib.mult.restype = c_int
 
-        lib.multf.argtypes = [POINTER(c_float), c_void_p, c_void_p,
+        lib.multf.argtypes = [POINTER(c_float), c_void_p,
                               c_float, c_float]
         lib.multf.restype = c_int
 
         res = c_double()
-        lib.mult(byref(res), None, None, 123, 321)
+        lib.mult(byref(res), None, 123, 321)
         self.assertEqual(res.value, 123 * 321)
 
         res = c_float()
-        lib.multf(byref(res), None, None, 987, 321)
+        lib.multf(byref(res), None, 987, 321)
         self.assertEqual(res.value, 987 * 321)
 
     def test_pycc_pymodule(self):

@@ -9,19 +9,31 @@ import sys
 import threading
 import warnings
 import inspect
+import pickle
+import weakref
+
+try:
+    import jinja2
+except ImportError:
+    jinja2 = None
+
+try:
+    import pygments
+except ImportError:
+    pygments = None
 
 import numpy as np
 
 from numba import unittest_support as unittest
 from numba import utils, jit, generated_jit, types, typeof
-from numba import config
 from numba import _dispatcher
 from numba.compiler import compile_isolated
 from numba.errors import NumbaWarning
 from .support import (TestCase, tag, temp_directory, import_dynamic,
-                      override_env_config, capture_cache_log)
+                      override_env_config, capture_cache_log, captured_stdout)
 from numba.targets import codegen
 from numba.caching import _UserWideCacheLocator
+from numba.dispatcher import Dispatcher
 
 import llvmlite.binding as ll
 
@@ -333,6 +345,50 @@ class TestDispatcher(BaseTest):
         [cr] = bar.overloads.values()
         self.assertEqual(len(cr.lifted), 1)
 
+    def test_serialization(self):
+        """
+        Test serialization of Dispatcher objects
+        """
+        @jit(nopython=True)
+        def foo(x):
+            return x + 1
+
+        self.assertEqual(foo(1), 2)
+
+        # get serialization memo
+        memo = Dispatcher._memo
+        Dispatcher._recent.clear()
+        memo_size = len(memo)
+
+        # pickle foo and check memo size
+        serialized_foo = pickle.dumps(foo)
+        # increases the memo size
+        self.assertEqual(memo_size + 1, len(memo))
+
+        # unpickle
+        foo_rebuilt = pickle.loads(serialized_foo)
+        self.assertEqual(memo_size + 1, len(memo))
+
+        self.assertIs(foo, foo_rebuilt)
+
+        # do we get the same object even if we delete all the explict references?
+        id_orig = id(foo_rebuilt)
+        del foo
+        del foo_rebuilt
+        self.assertEqual(memo_size + 1, len(memo))
+        new_foo = pickle.loads(serialized_foo)
+        self.assertEqual(id_orig, id(new_foo))
+
+        # now clear the recent cache
+        ref = weakref.ref(new_foo)
+        del new_foo
+        Dispatcher._recent.clear()
+        self.assertEqual(memo_size, len(memo))
+
+        # show that deserializing creates a new object
+        newer_foo = pickle.loads(serialized_foo)
+        self.assertIs(ref(), None)
+
 
 class TestSignatureHandling(BaseTest):
     """
@@ -548,8 +604,6 @@ class TestDispatcherMethods(TestCase):
         # just test for the attribute without running it.
         self.assertTrue(callable(cfg.display))
 
-    @unittest.skipIf(config.IS_WIN32 and not config.IS_32BITS, "access violation on 64-bit windows")
-    @unittest.skipIf(config.IS_OSX, "segfault on OSX")
     def test_inspect_cfg(self):
         # Exercise the .inspect_cfg(). These are minimal tests and do not fully
         # check the correctness of the function.
@@ -584,8 +638,6 @@ class TestDispatcherMethods(TestCase):
         cfg = foo.inspect_cfg(signature=foo.signatures[0])
         self._check_cfg_display(cfg)
 
-    @unittest.skipIf(config.IS_WIN32 and not config.IS_32BITS, "access violation on 64-bit windows")
-    @unittest.skipIf(config.IS_OSX, "segfault on OSX")
     def test_inspect_cfg_with_python_wrapper(self):
         # Exercise the .inspect_cfg() including the python wrapper.
         # These are minimal tests and do not fully check the correctness of
@@ -615,6 +667,34 @@ class TestDispatcherMethods(TestCase):
         foo(1, 2)
         # Exercise the method
         foo.inspect_types(utils.StringIO())
+
+    @unittest.skipIf(jinja2 is None, "please install the 'jinja2' package")
+    @unittest.skipIf(pygments is None, "please install the 'pygments' package")
+    def test_inspect_types_pretty(self):
+        @jit
+        def foo(a, b):
+            return a + b
+
+        foo(1, 2)
+
+        # Exercise the method, dump the output
+        with captured_stdout():
+            ann = foo.inspect_types(pretty=True)
+
+        # ensure HTML <span> is found in the annotation output
+        for k, v in ann.ann.items():
+            span_found = False
+            for line in v['pygments_lines']:
+                if 'span' in line[2]:
+                    span_found = True
+            self.assertTrue(span_found)
+
+        # check that file+pretty kwarg combo raises
+        with self.assertRaises(ValueError) as raises:
+            foo.inspect_types(file=utils.StringIO(), pretty=True)
+
+        self.assertIn("`file` must be None if `pretty=True`",
+                      str(raises.exception))
 
     def test_issue_with_array_layout_conflict(self):
         """
@@ -1107,7 +1187,7 @@ class TestCache(BaseCacheUsecasesTest):
         execute_with_input()
         # Run a second time and check caching
         err = execute_with_input()
-        self.assertEqual(err.strip(), "cache hits = 1")
+        self.assertIn("cache hits = 1", err.strip())
 
 
 class TestCacheWithCpuSetting(BaseCacheUsecasesTest):

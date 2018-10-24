@@ -6,8 +6,11 @@ import sys
 
 from .abstract import *
 from .common import *
+from numba.ir import Loc
 from numba import errors
 
+# terminal color markup
+_termcolor = errors.termcolor()
 
 class _ResolutionFailures(object):
     """Collect and format function resolution failures.
@@ -38,17 +41,21 @@ class _ResolutionFailures(object):
         indent = ' ' * 4
         args = [str(a) for a in self._args]
         args += ["%s=%s" % (k, v) for k, v in sorted(self._kwargs.items())]
-        headtmp = 'Invalid usage of {} with parameters ({})'
+        headtmp = 'Invalid use of {} with argument(s) of type(s): ({})'
         msgbuf = [headtmp.format(self._function_type, ', '.join(args))]
         explain = self._context.explain_function_type(self._function_type)
         msgbuf.append(explain)
         for i, (temp, error) in enumerate(self._failures):
             msgbuf.append("In definition {}:".format(i))
-            msgbuf.append('{}{}'.format(indent, self.format_error(error)))
+            msgbuf.append(_termcolor.highlight('{}{}'.format(
+                indent, self.format_error(error))))
             loc = self.get_loc(temp, error)
             if loc:
                 msgbuf.append('{}raised from {}'.format(indent, loc))
 
+        likely_cause = ("This error is usually caused by passing an argument "
+                        "of a type that is unsupported by the named function.")
+        msgbuf.append(_termcolor.errmsg(likely_cause))
         return '\n'.join(msgbuf)
 
     def format_error(self, error):
@@ -128,12 +135,13 @@ class BaseFunction(Callable):
                     self._impl_keys[sig.args] = temp.get_impl_key(sig)
                     return sig
                 else:
-                    failures.add_error(temp_cls, "rejected")
+                    failures.add_error(temp_cls, "All templates rejected")
 
         if len(failures) == 0:
             raise AssertionError("Internal Error. "
                                  "Function resolution ended with no failures "
                                  "or successfull signature")
+
         raise errors.TypingError(failures.format())
 
     def get_call_signatures(self):
@@ -275,6 +283,12 @@ class Dispatcher(WeakType, Callable, Dummy):
         Get the implementation key for the given signature.
         """
         return self.get_overload(sig)
+
+
+class ObjModeDispatcher(Dispatcher):
+    """Dispatcher subclass that enters objectmode function.
+    """
+    pass
 
 
 class ExternalFunctionPointer(BaseFunction):

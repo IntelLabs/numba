@@ -186,15 +186,25 @@ class MinimalCallConv(BaseCallConv):
         builder.store(retval, retptr)
         self._return_errcode_raw(builder, RETCODE_OK)
 
-    def return_user_exc(self, builder, exc, exc_args=None):
+    def return_user_exc(self, builder, exc, exc_args=None, loc=None):
         if exc is not None and not issubclass(exc, BaseException):
             raise TypeError("exc should be None or exception class, got %r"
                             % (exc,))
         if exc_args is not None and not isinstance(exc_args, tuple):
             raise TypeError("exc_args should be None or tuple, got %r"
                             % (exc_args,))
+
+        # Build excinfo struct
+        if loc is not None:
+            f1 = loc._raw_function_name()
+            locinfo = (f1, loc.filename, loc.line)
+            if None in locinfo:
+                locinfo = None
+        else:
+            locinfo = None
+
         call_helper = self._get_call_helper(builder)
-        exc_id = call_helper._add_exception(exc, exc_args)
+        exc_id = call_helper._add_exception(exc, exc_args, locinfo)
         self._return_errcode_raw(builder, _const_int(exc_id))
 
     def return_status_propagate(self, builder, status):
@@ -254,11 +264,10 @@ class MinimalCallConv(BaseCallConv):
         """
         return func.args[1:]
 
-    def call_function(self, builder, callee, resty, argtys, args, env=None):
+    def call_function(self, builder, callee, resty, argtys, args):
         """
         Call the Numba-compiled *callee*.
         """
-        assert env is None
         retty = callee.args[0].type.pointee
         retvaltmp = cgutils.alloca_once(builder, retty)
         # initialize return value
@@ -284,9 +293,19 @@ class _MinimalCallHelper(object):
     def __init__(self):
         self.exceptions = {}
 
-    def _add_exception(self, exc, exc_args):
+    def _add_exception(self, exc, exc_args, locinfo):
+        """
+        Parameters
+        ----------
+        exc :
+            exception type
+        exc_args : None or tuple
+            exception args
+        locinfo : tuple
+            location information
+        """
         exc_id = len(self.exceptions) + FIRST_USEREXC
-        self.exceptions[exc_id] = exc, exc_args
+        self.exceptions[exc_id] = exc, exc_args, locinfo
         return exc_id
 
     def get_exception(self, exc_id):
@@ -306,7 +325,7 @@ class CPUCallConv(BaseCallConv):
     The calling convention for CPU targets.
     The implemented function signature is:
 
-        retcode_t (<Python return type>*, excinfo **, env *, ... <Python arguments>)
+        retcode_t (<Python return type>*, excinfo **, ... <Python arguments>)
 
     The return code will be one of the RETCODE_* constants.
     If RETCODE_USEREXC, the exception info pointer will be filled with
@@ -315,9 +334,6 @@ class CPUCallConv(BaseCallConv):
     Caller is responsible for allocating slots for the return value
     and the exception info pointer (passed as first and second arguments,
     respectively).
-
-    The third argument (env *) is a _dynfunc.Environment object, used
-    only for object mode functions.
     """
     _status_ids = itertools.count(1)
 
@@ -331,17 +347,23 @@ class CPUCallConv(BaseCallConv):
         builder.store(retval, retptr)
         self._return_errcode_raw(builder, RETCODE_OK)
 
-    def return_user_exc(self, builder, exc, exc_args=None):
+    def return_user_exc(self, builder, exc, exc_args=None, loc=None):
         if exc is not None and not issubclass(exc, BaseException):
             raise TypeError("exc should be None or exception class, got %r"
                             % (exc,))
         if exc_args is not None and not isinstance(exc_args, tuple):
             raise TypeError("exc_args should be None or tuple, got %r"
                             % (exc_args,))
+
         pyapi = self.context.get_python_api(builder)
         # Build excinfo struct
-        if exc_args is not None:
-            exc = (exc, exc_args)
+        if loc is not None:
+            locinfo = (loc._raw_function_name(), loc.filename, loc.line)
+            if None in locinfo:
+                locinfo = None
+        else:
+            locinfo = None
+        exc = (exc, exc_args, locinfo)
         struct_gv = pyapi.serialize_object(exc)
         excptr = self._get_excinfo_argument(builder.function)
         builder.store(struct_gv, excptr)
@@ -387,7 +409,7 @@ class CPUCallConv(BaseCallConv):
         argtypes = list(arginfo.argument_types)
         resptr = self.get_return_type(restype)
         fnty = ir.FunctionType(errcode_t,
-                               [resptr, ir.PointerType(excinfo_ptr_t), PYOBJECT]
+                               [resptr, ir.PointerType(excinfo_ptr_t)]
                                + argtypes)
         return fnty
 
@@ -406,10 +428,6 @@ class CPUCallConv(BaseCallConv):
         excarg.name = "excinfo"
         excarg.add_attribute("nocapture")
         excarg.add_attribute("noalias")
-        envarg = self.get_env_argument(fn)
-        envarg.name = "env"
-        envarg.add_attribute("nocapture")
-        envarg.add_attribute("noalias")
 
         if noalias:
             args = self.get_arguments(fn)
@@ -423,13 +441,7 @@ class CPUCallConv(BaseCallConv):
         """
         Get the Python-level arguments of LLVM *func*.
         """
-        return func.args[3:]
-
-    def get_env_argument(self, func):
-        """
-        Get the environment argument of LLVM *func*.
-        """
-        return func.args[2]
+        return func.args[2:]
 
     def _get_return_argument(self, func):
         return func.args[0]
@@ -437,16 +449,10 @@ class CPUCallConv(BaseCallConv):
     def _get_excinfo_argument(self, func):
         return func.args[1]
 
-    def call_function(self, builder, callee, resty, argtys, args, env=None):
+    def call_function(self, builder, callee, resty, argtys, args):
         """
         Call the Numba-compiled *callee*.
         """
-        if env is None:
-            # This only works with functions that don't use the environment
-            # (nopython functions).
-            env = cgutils.get_null_value(PYOBJECT)
-        is_generator_function = isinstance(resty, types.Generator)
-
         # XXX better fix for callees that are not function values
         #     (pointers to function; thus have no `.args` attribute)
         retty = self._get_return_argument(callee.function_type).pointee
@@ -460,7 +466,7 @@ class CPUCallConv(BaseCallConv):
 
         arginfo = self._get_arg_packer(argtys)
         args = list(arginfo.as_arguments(builder, args))
-        realargs = [retvaltmp, excinfoptr, env] + args
+        realargs = [retvaltmp, excinfoptr] + args
         code = builder.call(callee, realargs)
         status = self._get_return_status(builder, code,
                                          builder.load(excinfoptr))
@@ -474,9 +480,10 @@ class ErrorModel(object):
     def __init__(self, call_conv):
         self.call_conv = call_conv
 
-    def fp_zero_division(self, builder, exc_args=None):
+    def fp_zero_division(self, builder, exc_args=None, loc=None):
         if self.raise_on_fp_zero_division:
-            self.call_conv.return_user_exc(builder, ZeroDivisionError, exc_args)
+            self.call_conv.return_user_exc(builder, ZeroDivisionError, exc_args,
+                                           loc)
             return True
         else:
             return False

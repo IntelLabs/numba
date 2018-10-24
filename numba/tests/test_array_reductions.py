@@ -1,6 +1,6 @@
 from __future__ import division
 
-from itertools import product
+from itertools import product, combinations_with_replacement
 
 import numpy as np
 
@@ -29,11 +29,17 @@ def array_cumprod(arr):
 def array_cumprod_global(arr):
     return np.cumprod(arr)
 
+def array_nancumprod(arr):
+    return np.nancumprod(arr)
+
 def array_cumsum(arr):
     return arr.cumsum()
 
 def array_cumsum_global(arr):
     return np.cumsum(arr)
+
+def array_nancumsum(arr):
+    return np.nancumsum(arr)
 
 def array_sum(arr):
     return arr.sum()
@@ -116,6 +122,11 @@ def array_nanvar(arr):
 def array_nanmedian_global(arr):
     return np.nanmedian(arr)
 
+def array_percentile_global(arr, q):
+    return np.percentile(arr, q)
+
+def array_nanpercentile_global(arr, q):
+    return np.nanpercentile(arr, q)
 
 def base_test_arrays(dtype):
     if dtype == np.bool_:
@@ -140,6 +151,15 @@ def full_test_arrays(dtype):
     # Add floats with some mantissa
     if dtype == np.float32:
         array_list += [a / 10 for a in array_list]
+
+    # add imaginary part
+    if dtype == np.complex64:
+        acc = []
+        for a in array_list:
+            tmp = a / 10 + 1j * a / 11
+            tmp[::2] = np.conj(tmp[::2])
+            acc.append(tmp)
+        array_list.extend(acc)
 
     for a in array_list:
         assert a.dtype == np.dtype(dtype)
@@ -330,25 +350,96 @@ class TestArrayReductions(MemoryLeakMixin, TestCase):
 
         self.check_median_basic(pyfunc, variations)
 
+    def check_percentile_basic(self, pyfunc, array_variations, percentile_variations):
+        cfunc = jit(nopython=True)(pyfunc)
+
+        def check(a, q):
+            expected = pyfunc(a, q)
+            got = cfunc(a, q)
+            self.assertPreciseEqual(got, expected, abs_tol='eps')
+
+        def check_err(a, q):
+            with self.assertRaises(ValueError) as raises:
+                cfunc(a, q)
+            self.assertEqual("Percentiles must be in the range [0,100]", str(raises.exception))
+
+        def perform_checks(a, q):
+            check(a, q)
+            a = a.reshape((3, 3, 7))
+            check(a, q)
+            check(a.astype(np.int32), q)
+
+        for a in array_variations(np.arange(63) - 10.5):
+            for q in percentile_variations(np.array([0, 50, 100, 66.6])):
+                perform_checks(a, q)
+
+        # Exceptions leak references
+        self.disable_leak_check()
+
+        a = np.arange(5)
+        check_err(a, -5)  # q less than 0
+        check_err(a, (1, 10, 105))  # q contains value greater than 100
+        check_err(a, (1, 10, np.nan))  # q contains nan
+
+    @staticmethod
+    def _array_variations(a):
+        # Sorted, reversed, random, many duplicates, many NaNs, all NaNs
+        yield a
+        a = a[::-1].copy()
+        yield a
+        np.random.shuffle(a)
+        yield a
+        a[a % 4 >= 1] = 3.5
+        yield a
+        a[a % 4 >= 2] = np.nan
+        yield a
+        a[:] = np.nan
+        yield a
+
+    @staticmethod
+    def _percentile_variations(q):
+        yield q
+        yield q[::-1].astype(np.int32).tolist()
+        yield q[-1]
+        yield int(q[-1])
+        yield tuple(q)
+        yield False
+
+    def check_percentile_edge_cases(self, pyfunc):
+        cfunc = jit(nopython=True)(pyfunc)
+
+        def check(a, q, abs_tol):
+            expected = pyfunc(a, q)
+            got = cfunc(a, q)
+            self.assertPreciseEqual(got, expected, abs_tol=abs_tol)
+
+        def _array_combinations(elements):
+            for i in range(1, 10):
+                for comb in combinations_with_replacement(elements, i):
+                    yield np.array(comb)
+
+        # high number of combinations, many including non-finite values
+        q = (0, 10, 20, 100)
+        element_pool = (1, -1, np.nan, np.inf, -np.inf)
+        for a in _array_combinations(element_pool):
+            check(a, q, abs_tol=1e-14)  # 'eps' fails, tbd...
+
+    @unittest.skipUnless(np_version >= (1, 10), "percentile needs Numpy 1.10+")
+    def test_percentile_basic(self):
+        pyfunc = array_percentile_global
+        self.check_percentile_basic(pyfunc, self._array_variations, self._percentile_variations)
+        self.check_percentile_edge_cases(pyfunc)
+
+    @unittest.skipUnless(np_version >= (1, 11), "nanpercentile needs Numpy 1.11+")
+    def test_nanpercentile_basic(self):
+        pyfunc = array_nanpercentile_global
+        self.check_percentile_basic(pyfunc, self._array_variations, self._percentile_variations)
+        self.check_percentile_edge_cases(pyfunc)
+
     @unittest.skipUnless(np_version >= (1, 9), "nanmedian needs Numpy 1.9+")
     def test_nanmedian_basic(self):
         pyfunc = array_nanmedian_global
-
-        def variations(a):
-            # Sorted, reversed, random, many duplicates, many NaNs
-            yield a
-            a = a[::-1].copy()
-            yield a
-            np.random.shuffle(a)
-            yield a
-            a[a % 4 <= 1] = 3.5
-            yield a
-            a[a % 4 >= 2] = float('nan')
-            yield a
-            a[:] = float('nan')
-            yield a
-
-        self.check_median_basic(pyfunc, variations)
+        self.check_median_basic(pyfunc, self._array_variations)
 
     def test_array_sum_global(self):
         arr = np.arange(10, dtype=np.int32)
@@ -446,6 +537,10 @@ class TestArrayReductions(MemoryLeakMixin, TestCase):
         self.check_aggregation_magnitude(array_cumsum)
         self.check_aggregation_magnitude(array_cumsum_global)
 
+    @unittest.skipUnless(np_version >= (1, 12), "nancumsum needs Numpy 1.12+")
+    def test_nancumsum_magnitude(self):
+        self.check_aggregation_magnitude(array_nancumsum, is_prod=True)
+
     def test_prod_magnitude(self):
         self.check_aggregation_magnitude(array_prod, is_prod=True)
         self.check_aggregation_magnitude(array_prod_global, is_prod=True)
@@ -453,6 +548,10 @@ class TestArrayReductions(MemoryLeakMixin, TestCase):
     def test_cumprod_magnitude(self):
         self.check_aggregation_magnitude(array_cumprod, is_prod=True)
         self.check_aggregation_magnitude(array_cumprod_global, is_prod=True)
+
+    @unittest.skipUnless(np_version >= (1, 12), "nancumprod needs Numpy 1.12+")
+    def test_nancumprod_magnitude(self):
+        self.check_aggregation_magnitude(array_nancumprod, is_prod=True)
 
     def test_mean_magnitude(self):
         self.check_aggregation_magnitude(array_mean)
@@ -521,47 +620,158 @@ class TestArrayReductions(MemoryLeakMixin, TestCase):
     def test_mean_npdatetime(self):
         self.check_nptimedelta(array_mean)
 
+    def check_nan_cumulative(self, pyfunc):
+        cfunc = jit(nopython=True)(pyfunc)
+
+        def check(a):
+            expected = pyfunc(a)
+            got = cfunc(a)
+            self.assertPreciseEqual(expected, got)
+
+        def _set_some_values_to_nan(a):
+            p = a.size // 2  # set approx half elements to NaN
+            np.put(a, np.random.choice(range(a.size), p, replace=False), np.nan)
+            return a
+
+        def a_variations():
+            yield np.linspace(-1, 3, 60).reshape(3, 4, 5)
+            yield np.array([np.inf, 3, 4])
+            yield np.array([True, True, True, False])
+            yield np.arange(1, 10)
+            yield np.asfortranarray(np.arange(1, 64) - 33.3)
+            yield np.arange(1, 10, dtype=np.float32)[::-1]
+
+        for a in a_variations():
+            check(a)  # no nans
+            check(_set_some_values_to_nan(a.astype(np.float64)))  # about 50% nans
+
+        # edge cases
+        check(np.array([]))
+        check(np.full(10, np.nan))
+
+        parts = np.array([np.nan, 2, np.nan, 4, 5, 6, 7, 8, 9])
+
+        a = parts + 1j * parts[::-1]
+        a = a.reshape(3, 3)
+        check(a)
+
+    @unittest.skipUnless(np_version >= (1, 12), "nancumprod needs Numpy 1.12+")
+    def test_nancumprod_basic(self):
+        self.check_cumulative(array_nancumprod)
+        self.check_nan_cumulative(array_nancumprod)
+
+    @unittest.skipUnless(np_version >= (1, 12), "nancumsum needs Numpy 1.12+")
+    def test_nancumsum_basic(self):
+        self.check_cumulative(array_nancumsum)
+        self.check_nan_cumulative(array_nancumsum)
+
     @classmethod
     def install_generated_tests(cls):
         # These form a testing product where each of the combinations are tested
+
+        # these function are tested in real and complex space
         reduction_funcs = [array_sum, array_sum_global,
                            array_prod, array_prod_global,
                            array_mean, array_mean_global,
                            array_var, array_var_global,
                            array_std, array_std_global,
-                           array_min, array_min_global,
-                           array_max, array_max_global,
-                           array_argmin, array_argmin_global,
-                           array_argmax, array_argmax_global,
                            array_all, array_all_global,
                            array_any, array_any_global,
-                           array_nanmax,
-                           array_nanmin,
                            array_nansum,
                            ]
+
+        # these functions only work in real space as no complex comparison
+        # operator is implemented
+        reduction_funcs_rspace = [array_min, array_min_global,
+                                  array_max, array_max_global,
+                                  array_argmin, array_argmin_global,
+                                  array_argmax, array_argmax_global,
+                                  array_nanmax, array_nanmin]
+
         if np_version >= (1, 8):
             reduction_funcs += [array_nanmean, array_nanstd, array_nanvar]
         if np_version >= (1, 10):
             reduction_funcs += [array_nanprod]
 
-        dtypes_to_test = [np.int32, np.float32, np.bool_]
+        dtypes_to_test = [np.int32, np.float32, np.bool_, np.complex64]
 
-        # Install tests on class
-        for dt in dtypes_to_test:
-            test_arrays = full_test_arrays(dt)
-            for red_func, test_array in product(reduction_funcs, test_arrays):
-                # Create the name for the test function
-                test_name = "test_{0}_{1}_{2}d".format(red_func.__name__, test_array.dtype.name, test_array.ndim)
+        def install_tests(dtypes, funcs):
+            # Install tests on class
+            for dt in dtypes:
+                test_arrays = full_test_arrays(dt)
+                for red_func, test_array in product(funcs, test_arrays):
+                    # Create the name for the test function
+                    test_name = "test_{0}_{1}_{2}d"
+                    test_name = test_name.format(red_func.__name__,
+                                                 test_array.dtype.name,
+                                                 test_array.ndim)
 
-                def new_test_function(self, redFunc=red_func, testArray=test_array, testName=test_name):
-                    npr, nbr = run_comparative(redFunc, testArray)
-                    self.assertPreciseEqual(npr, nbr, msg=test_name, prec="single")
+                    def new_test_function(self, redFunc=red_func,
+                                          testArray=test_array,
+                                          testName=test_name):
+                        ulps = 1
+                        if 'prod' in red_func.__name__ and \
+                            np.iscomplexobj(testArray):
+                            # prod family accumulate slightly more error on
+                            # some architectures (power, 32bit) for complex input
+                            ulps = 3
+                        npr, nbr = run_comparative(redFunc, testArray)
+                        self.assertPreciseEqual(npr, nbr, msg=test_name,
+                                                prec="single", ulps=ulps)
 
-                # Install it into the class
-                setattr(cls, test_name, new_test_function)
+                    # Install it into the class
+                    setattr(cls, test_name, new_test_function)
+
+        # install tests for reduction functions that only work in real space
+        install_tests(dtypes_to_test[:-1], reduction_funcs_rspace)
+
+        # install tests for reduction functions
+        install_tests(dtypes_to_test, reduction_funcs)
 
 
 TestArrayReductions.install_generated_tests()
+
+
+class TestArrayReductionsExceptions(MemoryLeakMixin, TestCase):
+
+    # int64, size 0
+    zero_size = np.arange(0)
+
+    def check_exception(self, pyfunc, msg):
+        cfunc = jit(nopython=True)(pyfunc)
+        # make sure NumPy raises consistently/no behaviour change
+        with self.assertRaises(BaseException):
+            pyfunc(self.zero_size)
+        # check numba impl raises expected
+        with self.assertRaises(ValueError) as e:
+            cfunc(self.zero_size)
+        self.assertIn(msg, str(e.exception))
+
+    @classmethod
+    def install(cls):
+
+        fn_to_msg = dict()
+        empty_seq = "attempt to get {0} of an empty sequence"
+        op_no_ident = ("zero-size array to reduction operation "
+                       "{0}")
+        for x in [array_argmax, array_argmax_global, array_argmin,
+                  array_argmin_global]:
+            fn_to_msg[x] = empty_seq
+        for x in [array_max, array_max, array_min, array_min]:
+            fn_to_msg[x] = op_no_ident
+
+        name_template = "test_zero_size_array_{0}"
+        for fn, msg in fn_to_msg.items():
+            test_name = name_template.format(fn.__name__)
+
+            lmsg = msg.format(fn.__name__)
+            lmsg = lmsg.replace('array_','').replace('_global','')
+            def test_fn(self, func=fn, message=lmsg):
+                self.check_exception(func, message)
+
+            setattr(cls, test_name, test_fn)
+
+TestArrayReductionsExceptions.install()
 
 
 if __name__ == '__main__':

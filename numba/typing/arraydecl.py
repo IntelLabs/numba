@@ -1,12 +1,12 @@
 from __future__ import print_function, division, absolute_import
 
 import numpy as np
-
+import operator
 from collections import namedtuple
 
 from numba import types, utils
-from numba.typing.templates import (AttributeTemplate, AbstractTemplate,
-                                    infer, infer_getattr, signature,
+from numba.typing.templates import (AttributeTemplate, AbstractTemplate, infer,
+                                    infer_global, infer_getattr, signature,
                                     bound_function)
 # import time side effect: array operations requires typing support of sequence
 # defined in collections: e.g. array.shape[i]
@@ -144,7 +144,11 @@ def get_array_index_type(ary, idx):
             elif not check_contiguity(right_indices[::-1]):
                 layout = 'A'
 
-        res = ary.copy(ndim=ndim, layout=layout)
+        if ndim == 0:
+            # Implicitly convert to a scalar if the output ndim==0
+            res = ary.dtype
+        else:
+            res = ary.copy(ndim=ndim, layout=layout)
 
     # Re-wrap indices
     if isinstance(idx, types.BaseTuple):
@@ -416,8 +420,8 @@ class ArrayAttribute(AttributeTemplate):
         kwargs = dict(kws)
         kind = kwargs.pop('kind', types.Const('quicksort'))
         if kwargs:
-            msg = "usupported keywords: {!r}"
-            raise TypingError(msg.format(kwargs.keys()))
+            msg = "Unsupported keywords: {!r}"
+            raise TypingError(msg.format([k for k in kwargs.keys()]))
         if ary.ndim == 1:
             def argsort_stub(kind='quicksort'):
                 pass
@@ -646,6 +650,15 @@ def generic_hetero_real(self, args, kws):
         return signature(types.float64, recvr=self.this)
     return signature(self.this.dtype, recvr=self.this)
 
+def generic_hetero_always_real(self, args, kws):
+    assert not args
+    assert not kws
+    if isinstance(self.this.dtype, (types.Integer, types.Boolean)):
+        return signature(types.float64, recvr=self.this)
+    if isinstance(self.this.dtype, types.Complex):
+        return signature(self.this.dtype.underlying_float, recvr=self.this)
+    return signature(self.this.dtype, recvr=self.this)
+
 def generic_index(self, args, kws):
     assert not args
     assert not kws
@@ -674,17 +687,23 @@ for fname in ["cumsum", "cumprod"]:
     install_array_method(fname, generic_expand_cumulative)
 
 # Functions that require integer arrays get promoted to float64 return
-for fName in ["mean", "var", "std"]:
+for fName in ["mean"]:
     install_array_method(fName, generic_hetero_real)
+
+# var and std by definition return in real space and int arrays
+# get promoted to float64 return
+for fName in ["var", "std"]:
+    install_array_method(fName, generic_hetero_always_real)
+
 
 # Functions that return an index (intp)
 install_array_method("argmin", generic_index)
 install_array_method("argmax", generic_index)
 
 
-@infer
+@infer_global(operator.eq)
 class CmpOpEqArray(AbstractTemplate):
-    key = '=='
+    #key = operator.eq
 
     def generic(self, args, kws):
         assert not kws

@@ -16,7 +16,9 @@ from __future__ import print_function, division, absolute_import
 import types as pytypes  # avoid confusion with numba.types
 import sys, math
 from functools import reduce
-from collections import defaultdict
+from collections import defaultdict, namedtuple
+from contextlib import contextmanager
+import operator
 
 import numba
 from numba import ir, ir_utils, types, typing, rewrites, config, analysis, prange, pndindex
@@ -25,6 +27,7 @@ from numba.numpy_support import as_dtype
 from numba.typing.templates import infer_global, AbstractTemplate
 from numba import stencilparfor
 from numba.stencilparfor import StencilPass
+from numba.extending import register_jitable
 
 
 from numba.ir_utils import (
@@ -64,7 +67,12 @@ from numba.ir_utils import (
     get_definition,
     build_definitions,
     replace_arg_nodes,
-    replace_returns)
+    replace_returns,
+    is_getitem,
+    is_setitem,
+    is_get_setitem,
+    index_var_of_get_setitem,
+    set_index_var_of_get_setitem)
 
 from numba.analysis import (compute_use_defs, compute_live_map,
                             compute_dead_maps, compute_cfg_from_blocks)
@@ -105,6 +113,7 @@ def min_parallel_impl(return_type, arg):
     if arg.ndim == 1:
         def min_1(in_arr):
             numba.parfor.init_prange()
+            min_checker(len(in_arr))
             val = numba.targets.builtins.get_type_max_value(in_arr.dtype)
             for i in numba.parfor.internal_prange(len(in_arr)):
                 val = min(val, in_arr[i])
@@ -112,6 +121,7 @@ def min_parallel_impl(return_type, arg):
     else:
         def min_1(in_arr):
             numba.parfor.init_prange()
+            min_checker(len(in_arr))
             val = numba.targets.builtins.get_type_max_value(in_arr.dtype)
             for i in numba.pndindex(in_arr.shape):
                 val = min(val, in_arr[i])
@@ -122,6 +132,7 @@ def max_parallel_impl(return_type, arg):
     if arg.ndim == 1:
         def max_1(in_arr):
             numba.parfor.init_prange()
+            max_checker(len(in_arr))
             val = numba.targets.builtins.get_type_min_value(in_arr.dtype)
             for i in numba.parfor.internal_prange(len(in_arr)):
                 val = max(val, in_arr[i])
@@ -129,6 +140,7 @@ def max_parallel_impl(return_type, arg):
     else:
         def max_1(in_arr):
             numba.parfor.init_prange()
+            max_checker(len(in_arr))
             val = numba.targets.builtins.get_type_min_value(in_arr.dtype)
             for i in numba.pndindex(in_arr.shape):
                 val = max(val, in_arr[i])
@@ -137,6 +149,7 @@ def max_parallel_impl(return_type, arg):
 
 def argmin_parallel_impl(in_arr):
     numba.parfor.init_prange()
+    argmin_checker(len(in_arr))
     A = in_arr.ravel()
     init_val = numba.targets.builtins.get_type_max_value(A.dtype)
     ival = numba.typing.builtins.IndexValue(0, init_val)
@@ -147,6 +160,7 @@ def argmin_parallel_impl(in_arr):
 
 def argmax_parallel_impl(in_arr):
     numba.parfor.init_prange()
+    argmax_checker(len(in_arr))
     A = in_arr.ravel()
     init_val = numba.targets.builtins.get_type_min_value(A.dtype)
     ival = numba.typing.builtins.IndexValue(0, init_val)
@@ -278,7 +292,8 @@ def var_parallel_impl(return_type, arg):
             numba.parfor.init_prange()
             ssd = 0
             for i in numba.parfor.internal_prange(len(in_arr)):
-                ssd += (in_arr[i] - m) ** 2
+                val = in_arr[i] - m
+                ssd += np.real(val * np.conj(val))
             return ssd / len(in_arr)
     else:
         def var_1(in_arr):
@@ -288,7 +303,8 @@ def var_parallel_impl(return_type, arg):
             numba.parfor.init_prange()
             ssd = 0
             for i in numba.pndindex(in_arr.shape):
-                ssd += (in_arr[i] - m) ** 2
+                val = in_arr[i] - m
+                ssd += np.real(val * np.conj(val))
             return ssd / in_arr.size
     return var_1
 
@@ -370,6 +386,8 @@ replace_functions_map = {
     ('argmax', 'numpy'): lambda r,a: argmax_parallel_impl,
     ('min', 'numpy'): min_parallel_impl,
     ('max', 'numpy'): max_parallel_impl,
+    ('amin', 'numpy'): min_parallel_impl,
+    ('amax', 'numpy'): max_parallel_impl,
     ('sum', 'numpy'): sum_parallel_impl,
     ('prod', 'numpy'): prod_parallel_impl,
     ('mean', 'numpy'): mean_parallel_impl,
@@ -379,6 +397,40 @@ replace_functions_map = {
     ('arange', 'numpy'): arange_parallel_impl,
     ('linspace', 'numpy'): linspace_parallel_impl,
 }
+
+@register_jitable
+def max_checker(arr_size):
+    if arr_size == 0:
+        raise ValueError(("zero-size array to reduction operation "
+                            "maximum which has no identity"))
+
+@register_jitable
+def min_checker(arr_size):
+    if arr_size == 0:
+        raise ValueError(("zero-size array to reduction operation "
+                            "minimum which has no identity"))
+
+@register_jitable
+def argmin_checker(arr_size):
+    if arr_size == 0:
+        raise ValueError("attempt to get argmin of an empty sequence")
+
+@register_jitable
+def argmax_checker(arr_size):
+    if arr_size == 0:
+        raise ValueError("attempt to get argmax of an empty sequence")
+
+checker_impl = namedtuple('checker_impl', ['name', 'func'])
+
+replace_functions_checkers_map = {
+    ('argmin', 'numpy') : checker_impl('argmin_checker', argmin_checker),
+    ('argmax', 'numpy') : checker_impl('argmax_checker', argmax_checker),
+    ('min', 'numpy') : checker_impl('min_checker', min_checker),
+    ('max', 'numpy') : checker_impl('max_checker', max_checker),
+    ('amin', 'numpy') : checker_impl('min_checker', min_checker),
+    ('amax', 'numpy') : checker_impl('max_checker', max_checker),
+}
+
 
 class LoopNest(object):
 
@@ -423,7 +475,8 @@ class Parfor(ir.Expr, ir.Stmt):
             equiv_set,
             pattern,
             flags,
-            no_sequential_lowering=False):
+            no_sequential_lowering=False,
+            races=set()):
         super(Parfor, self).__init__(
             op='parfor',
             loc=loc
@@ -447,6 +500,7 @@ class Parfor(ir.Expr, ir.Stmt):
         # if True, this parfor shouldn't be lowered sequentially even with the
         # sequential lowering option
         self.no_sequential_lowering = no_sequential_lowering
+        self.races = races
         if config.DEBUG_ARRAY_OPT_STATS:
             fmt = 'Parallel for-loop #{} is produced from pattern \'{}\' at {}'
             print(fmt.format(
@@ -473,8 +527,23 @@ class Parfor(ir.Expr, ir.Stmt):
 
         return all_uses
 
-    def get_shape_classes(self, var):
-        return self.equiv_set.get_shape_classes(var)
+    def get_shape_classes(self, var, typemap=None):
+        """get the shape classes for a given variable.
+        If a typemap is specified then use it for type resolution
+        """
+        # We get shape classes from the equivalence set but that
+        # keeps its own typemap at a time prior to lowering.  So
+        # if something is added during lowering then we can pass
+        # in a type map to use.  We temporarily replace the
+        # equivalence set typemap, do the work and then restore
+        # the original on the way out.
+        if typemap is not None:
+            save_typemap = self.equiv_set.typemap
+            self.equiv_set.typemap = typemap
+        res = self.equiv_set.get_shape_classes(var)
+        if typemap is not None:
+            self.equiv_set.typemap = save_typemap
+        return res
 
     def dump(self, file=None):
         file = file or sys.stdout
@@ -494,7 +563,6 @@ def _analyze_parfor(parfor, equiv_set, typemap, array_analysis):
     """
     func_ir = array_analysis.func_ir
     parfor_blocks = wrap_parfor_blocks(parfor)
-    build_definitions(blocks=parfor_blocks, func_ir=func_ir)
     # Since init_block get label 0 after wrap, we need to save
     # the equivset for the real block label 0.
     backup_equivset = array_analysis.equiv_sets.get(0, None)
@@ -562,6 +630,12 @@ class PreParforPass(object):
                             g['numba'] = numba
                             g['np'] = numpy
                             g['math'] = math
+                            # if the function being inlined has a function
+                            # checking the inputs, find it and add it to globals
+                            check = replace_functions_checkers_map.get(callname,
+                                                                       None)
+                            if check is not None:
+                                g[check.name] = check.func
                             # inline the parallel implementation
                             inline_closure_call(self.func_ir, g,
                                             block, i, new_func, self.typingctx, typs,
@@ -571,10 +645,17 @@ class PreParforPass(object):
                             break
                     elif (isinstance(expr, ir.Expr) and expr.op == 'getattr' and
                           expr.attr == 'dtype'):
-                        # Replace getattr call "A.dtype" with the actual type itself.
-                        # This helps remove superfulous dependencies from parfor.
+                        # Replace getattr call "A.dtype" with numpy.dtype(<actual type>).
+                        # This helps remove superfluous dependencies from parfor.
                         typ = self.typemap[expr.value.name]
                         if isinstance(typ, types.npytypes.Array):
+                            # Convert A.dtype to four statements.
+                            # 1) Get numpy global.
+                            # 2) Create var for known type of array, e.g., numpy.float64
+                            # 3) Get dtype function from numpy module.
+                            # 4) Create var for numpy.dtype(var from #2).
+
+                            # Create var for numpy module.
                             dtype = typ.dtype
                             scope = block.scope
                             loc = instr.loc
@@ -582,18 +663,46 @@ class PreParforPass(object):
                             self.typemap[g_np_var.name] = types.misc.Module(numpy)
                             g_np = ir.Global('np', numpy, loc)
                             g_np_assign = ir.Assign(g_np, g_np_var, loc)
+
+                            # Create var for type infered type of the array, e.g., numpy.float64.
                             typ_var = ir.Var(scope, mk_unique_var("$np_typ_var"), loc)
-                            self.typemap[typ_var.name] = types.DType(dtype)
+                            self.typemap[typ_var.name] = types.functions.NumberClass(dtype)
                             dtype_str = str(dtype)
                             if dtype_str == 'bool':
                                 dtype_str = 'bool_'
                             np_typ_getattr = ir.Expr.getattr(g_np_var, dtype_str, loc)
                             typ_var_assign = ir.Assign(np_typ_getattr, typ_var, loc)
-                            instr.value = typ_var
+
+                            # Get the dtype function from the numpy module.
+                            dtype_attr_var = ir.Var(scope, mk_unique_var("$dtype_attr_var"), loc)
+                            temp = find_template(numpy.dtype)
+                            tfunc = numba.types.Function(temp)
+                            tfunc.get_call_type(self.typingctx, (self.typemap[typ_var.name],), {})
+                            self.typemap[dtype_attr_var.name] = types.functions.Function(temp)
+                            dtype_attr_getattr = ir.Expr.getattr(g_np_var, 'dtype', loc)
+                            dtype_attr_assign = ir.Assign(dtype_attr_getattr, dtype_attr_var, loc)
+
+                            # Call numpy.dtype on the statically coded type two steps above.
+                            dtype_var = ir.Var(scope, mk_unique_var("$dtype_var"), loc)
+                            self.typemap[dtype_var.name] = types.npytypes.DType(dtype)
+                            dtype_getattr = ir.Expr.call(dtype_attr_var, [typ_var], (), loc)
+                            dtype_assign = ir.Assign(dtype_getattr, dtype_var, loc)
+                            self.calltypes[dtype_getattr] = signature(
+                                self.typemap[dtype_var.name], self.typemap[typ_var.name])
+
+                            # The original A.dtype rhs is replaced with result of this call.
+                            instr.value = dtype_var
+                            # Add statements to body of the code.
+                            block.body.insert(0, dtype_assign)
+                            block.body.insert(0, dtype_attr_assign)
                             block.body.insert(0, typ_var_assign)
                             block.body.insert(0, g_np_assign)
                             break
 
+def find_template(op):
+    for ft in numba.typing.templates.builtin_registry.functions:
+        if ft.key == op:
+            return ft
 
 class ParforPass(object):
 
@@ -647,7 +756,7 @@ class ParforPass(object):
         simplify(self.func_ir, self.typemap, self.calltypes)
 
         if self.options.fusion:
-            self.func_ir._definitions = build_definitions(blocks=self.func_ir.blocks)
+            self.func_ir._definitions = build_definitions(self.func_ir.blocks)
             self.array_analysis.equiv_sets = dict()
             self.array_analysis.run(self.func_ir.blocks)
             # reorder statements to maximize fusion
@@ -852,6 +961,17 @@ class ParforPass(object):
                     # Add an empty block to the end of loop body
                     end_label = next_label()
                     loop_body[end_label] = ir.Block(scope, loc)
+
+                    # Detect races in the prange.
+                    # Races are defs in the parfor body that are live at the exit block.
+                    bodydefs = set()
+                    for bl in body_labels:
+                        bodydefs = bodydefs.union(usedefs.defmap[bl])
+                    exit_lives = set()
+                    for bl in loop.exits:
+                        exit_lives = exit_lives.union(live_map[bl])
+                    races = bodydefs.intersection(exit_lives)
+
                     # replace jumps to header block with the end block
                     for l in body_labels:
                         last_inst = loop_body[l].body[-1]
@@ -909,6 +1029,9 @@ class ParforPass(object):
                             expr.value = result[0]
                         return result
 
+                    # pndindex and prange are provably positive except when
+                    # user provides negative start to prange()
+                    unsigned_index = True
                     # TODO: support array mask optimization for prange
                     # TODO: refactor and simplify array mask optimization
                     if loop_kind == 'pndindex':
@@ -990,16 +1113,22 @@ class ParforPass(object):
                             index_var_typ = types.uintp
                         else:
                             index_var_typ = types.intp
+                            unsigned_index = False
                         loops = [LoopNest(index_var, start, size_var, step)]
                         self.typemap[index_var.name] = index_var_typ
 
                     index_var_map = {v: index_var for v in loop_index_vars}
                     replace_vars(loop_body, index_var_map)
+                    if unsigned_index:
+                        # need to replace signed array access indices to enable
+                        # optimizations (see #2846)
+                        self._replace_loop_access_indices(
+                            loop_body, loop_index_vars, index_var)
                     parfor = Parfor(loops, init_block, loop_body, loc,
                                     orig_index_var if mask_indices else index_var,
                                     equiv_set,
                                     ("prange", loop_kind),
-                                    self.flags)
+                                    self.flags, races=races)
                     # add parfor to entry block's jump target
                     jump = blocks[entry].body[-1]
                     jump.target = list(loop.exits)[0]
@@ -1008,6 +1137,78 @@ class ParforPass(object):
                     blocks.pop(loop.header)
                     for l in body_labels:
                         blocks.pop(l)
+
+    def _replace_loop_access_indices(self, loop_body, index_set, new_index):
+        """
+        Replace array access indices in a loop body with a new index.
+        index_set has all the variables that are equivalent to loop index.
+        """
+        # treat new index like others since replacing it with itself is ok
+        index_set.add(new_index.name)
+
+        with dummy_return_in_loop_body(loop_body):
+            labels = find_topo_order(loop_body)
+
+        first_label = labels[0]
+        added_indices = set()
+
+        # traverse loop body and replace indices in getitem/setitem with
+        # new_index if possible.
+        # also, find equivalent indices defined in first block.
+        for l in labels:
+            block = loop_body[l]
+            for stmt in block.body:
+                if (isinstance(stmt, ir.Assign)
+                        and isinstance(stmt.value, ir.Var)):
+                    # the first block dominates others so we can use copies
+                    # of indices safely
+                    if (l == first_label and stmt.value.name in index_set
+                            and stmt.target.name not in index_set):
+                        index_set.add(stmt.target.name)
+                        added_indices.add(stmt.target.name)
+                    # make sure parallel index is not overwritten
+                    elif stmt.target.name in index_set:
+                        raise ValueError(
+                            "Overwrite of parallel loop index at {}".format(
+                            stmt.target.loc))
+
+                if is_get_setitem(stmt):
+                    index = index_var_of_get_setitem(stmt)
+                    # statics can have none indices
+                    if index is None:
+                        continue
+                    ind_def = guard(get_definition, self.func_ir,
+                                    index, lhs_only=True)
+                    if (index.name in index_set
+                            or (ind_def is not None
+                                and ind_def.name in index_set)):
+                        set_index_var_of_get_setitem(stmt, new_index)
+                    # corner case where one dimension of a multi-dim access
+                    # should be replaced
+                    guard(self._replace_multi_dim_ind, ind_def, index_set,
+                                                                     new_index)
+
+                if isinstance(stmt, Parfor):
+                    self._replace_loop_access_indices(stmt.loop_body, index_set, new_index)
+
+        # remove added indices for currect recursive parfor handling
+        index_set -= added_indices
+        return
+
+    def _replace_multi_dim_ind(self, ind_var, index_set, new_index):
+        """
+        replace individual indices in multi-dimensional access variable, which
+        is a build_tuple
+        """
+        require(ind_var is not None)
+        # check for Tuple instead of UniTuple since some dims could be slices
+        require(isinstance(self.typemap[ind_var.name],
+                (types.Tuple, types.UniTuple)))
+        ind_def_node = get_definition(self.func_ir, ind_var)
+        require(isinstance(ind_def_node, ir.Expr)
+                and ind_def_node.op == 'build_tuple')
+        ind_def_node.items = [new_index if v.name in index_set else v
+                              for v in ind_def_node.items]
 
     def _find_mask(self, arr_def):
         """check if an array is of B[...M...], where M is a
@@ -1196,7 +1397,7 @@ class ParforPass(object):
                 avail_vars))
 
         parfor = Parfor(loopnests, init_block, {}, loc, index_var, equiv_set,
-                        ('arrayexpr {}'.format(repr_arrayexpr(arrayexpr.expr)),), 
+                        ('arrayexpr {}'.format(repr_arrayexpr(arrayexpr.expr)),),
                         self.flags)
 
         setitem_node = ir.SetItem(lhs, index_var, expr_out_var, loc)
@@ -1307,7 +1508,7 @@ class ParforPass(object):
         this Numpy call.
         """
         call_name, mod_name = find_callname(self.func_ir, expr)
-        if not mod_name.startswith('numpy'):
+        if not (isinstance(mod_name, str) and mod_name.startswith('numpy')):
             return False
         if call_name in ['zeros', 'ones']:
             return True
@@ -1620,7 +1821,7 @@ def _arrayexpr_tree_to_ir(
                 el_typ2 = typemap[arg_vars[1].name]
                 func_typ = find_op_typ(op, [el_typ1, el_typ2])
                 ir_expr = ir.Expr.binop(op, arg_vars[0], arg_vars[1], loc)
-                if op == '/':
+                if op == operator.truediv:
                     func_typ, ir_expr = _gen_np_divide(
                         arg_vars[0], arg_vars[1], out_ir, typemap)
             else:
@@ -1917,7 +2118,7 @@ def get_parfor_params(blocks, options_fusion):
             dummy_block.body = block.body[:i]
             before_defs = compute_use_defs({0: dummy_block}).defmap[0]
             pre_defs |= before_defs
-            parfor.params = get_parfor_params_inner(parfor, pre_defs, options_fusion)
+            parfor.params = get_parfor_params_inner(parfor, pre_defs, options_fusion) | parfor.races
             parfor_ids.add(parfor.id)
 
         pre_defs |= all_defs[label]
@@ -2046,9 +2247,9 @@ def get_reduction_init(nodes):
     require(nodes[-2].target.name == nodes[-1].value.name)
     acc_expr = nodes[-2].value
     require(isinstance(acc_expr, ir.Expr) and acc_expr.op=='inplace_binop')
-    if acc_expr.fn == '+=':
+    if acc_expr.fn == operator.iadd:
         return 0
-    if acc_expr.fn == '*=':
+    if acc_expr.fn == operator.imul:
         return 1
     return None
 
@@ -2465,36 +2666,52 @@ def get_parfor_pattern_vars(parfor):
                     out.add(v.name)
     return out
 
-def remove_dead_parfor(parfor, lives, arg_aliases, alias_map, typemap):
+def remove_dead_parfor(parfor, lives, arg_aliases, alias_map, func_ir, typemap):
     """ remove dead code inside parfor including get/sets
     """
 
+    with dummy_return_in_loop_body(parfor.loop_body):
+        labels = find_topo_order(parfor.loop_body)
+
+    # get/setitem replacement should ideally use dataflow to propagate setitem
+    # saved values, but for simplicity we handle the common case of propagating
+    # setitems in the first block (which is dominant) if the array is not
+    # potentially changed in any way
+    first_label = labels[0]
+    first_block_saved_values = {}
+    _update_parfor_get_setitems(
+        parfor.loop_body[first_label].body,
+        parfor.index_var, alias_map,
+        first_block_saved_values,
+        lives
+        )
+
+    # remove saved first block setitems if array potentially changed later
+    saved_arrs = set(first_block_saved_values.keys())
+    for l in labels:
+        if l == first_label:
+            continue
+        for stmt in parfor.loop_body[l].body:
+            if (isinstance(stmt, ir.Assign) and isinstance(stmt.value, ir.Expr)
+                    and stmt.value.op == 'getitem'
+                    and stmt.value.index.name == parfor.index_var.name):
+                continue
+            varnames = set(v.name for v in stmt.list_vars())
+            rm_arrs = varnames & saved_arrs
+            for a in rm_arrs:
+                first_block_saved_values.pop(a, None)
+
+
     # replace getitems with available value
     # e.g. A[i] = v; ... s = A[i]  ->  s = v
-    for block in parfor.loop_body.values():
-        saved_values = {}
-        for stmt in block.body:
-            if (isinstance(stmt, ir.SetItem) and stmt.index.name ==
-                    parfor.index_var.name and stmt.target.name not in lives):
-                saved_values[stmt.target.name] = stmt.value
-                # saved values of aliases of SetItem target array are invalid
-                for w in alias_map.get(stmt.target.name, []):
-                    saved_values.pop(w, None)
-                continue
-            if isinstance(stmt, ir.Assign) and isinstance(stmt.value, ir.Expr):
-                rhs = stmt.value
-                if rhs.op == 'getitem' and isinstance(rhs.index, ir.Var):
-                    if rhs.index.name == parfor.index_var.name:
-                        # replace getitem if value saved
-                        stmt.value = saved_values.get(rhs.value.name, rhs)
-                        continue
-            # conservative assumption: array is modified if referenced
-            # remove all referenced arrays
-            for v in stmt.list_vars():
-                saved_values.pop(v.name, None)
-                # aliases are potentially modified as well
-                for w in alias_map.get(v.name, []):
-                    saved_values.pop(w, None)
+    for l in labels:
+        if l == first_label:
+            continue
+        block = parfor.loop_body[l]
+        saved_values = first_block_saved_values.copy()
+        _update_parfor_get_setitems(block.body, parfor.index_var, alias_map,
+                                        saved_values, lives)
+
 
     # after getitem replacement, remove extra setitems
     blocks = parfor.loop_body.copy()  # shallow copy is enough
@@ -2534,7 +2751,7 @@ def remove_dead_parfor(parfor, lives, arg_aliases, alias_map, typemap):
 
     # process parfor body recursively
     remove_dead_parfor_recursive(
-        parfor, lives, arg_aliases, alias_map, typemap)
+        parfor, lives, arg_aliases, alias_map, func_ir, typemap)
 
     # remove parfor if empty
     is_empty = len(parfor.init_block.body) == 0
@@ -2544,11 +2761,43 @@ def remove_dead_parfor(parfor, lives, arg_aliases, alias_map, typemap):
         return None
     return parfor
 
+def _update_parfor_get_setitems(block_body, index_var, alias_map,
+                                  saved_values, lives):
+    """
+    replace getitems of a previously set array in a block of parfor loop body
+    """
+    for stmt in block_body:
+        if (isinstance(stmt, ir.SetItem) and stmt.index.name ==
+                index_var.name and stmt.target.name not in lives):
+            # saved values of aliases of SetItem target array are invalid
+            for w in alias_map.get(stmt.target.name, []):
+                saved_values.pop(w, None)
+            # set saved value after invalidation since alias_map may
+            # contain the array itself (e.g. pi example)
+            saved_values[stmt.target.name] = stmt.value
+            continue
+        if isinstance(stmt, ir.Assign) and isinstance(stmt.value, ir.Expr):
+            rhs = stmt.value
+            if rhs.op == 'getitem' and isinstance(rhs.index, ir.Var):
+                if rhs.index.name == index_var.name:
+                    # replace getitem if value saved
+                    stmt.value = saved_values.get(rhs.value.name, rhs)
+                    continue
+        # conservative assumption: array is modified if referenced
+        # remove all referenced arrays
+        for v in stmt.list_vars():
+            saved_values.pop(v.name, None)
+            # aliases are potentially modified as well
+            for w in alias_map.get(v.name, []):
+                saved_values.pop(w, None)
+
+    return
 
 ir_utils.remove_dead_extensions[Parfor] = remove_dead_parfor
 
 
-def remove_dead_parfor_recursive(parfor, lives, arg_aliases, alias_map, typemap):
+def remove_dead_parfor_recursive(parfor, lives, arg_aliases, alias_map,
+                                                             func_ir, typemap):
     """create a dummy function from parfor and call remove dead recursively
     """
     blocks = parfor.loop_body.copy()  # shallow copy is enough
@@ -2567,7 +2816,7 @@ def remove_dead_parfor_recursive(parfor, lives, arg_aliases, alias_map, typemap)
     blocks[0].body.append(ir.Jump(first_body_block, ir.Loc("parfors_dummy", -1)))
 
     # args var including aliases is ok
-    remove_dead(blocks, arg_aliases, typemap, alias_map, arg_aliases)
+    remove_dead(blocks, arg_aliases, func_ir, typemap, alias_map, arg_aliases)
     typemap.pop(tuple_var.name)  # remove dummy tuple type
     blocks[0].body.pop()  # remove dummy jump
     blocks[last_label].body.pop()  # remove branch
@@ -2593,10 +2842,10 @@ def _add_liveness_return_block(blocks, lives, typemap):
     return return_label, tuple_var
 
 
-def find_potential_aliases_parfor(parfor, args, typemap, alias_map, arg_aliases):
+def find_potential_aliases_parfor(parfor, args, typemap, func_ir, alias_map, arg_aliases):
     blocks = wrap_parfor_blocks(parfor)
     ir_utils.find_potential_aliases(
-        blocks, args, typemap, alias_map, arg_aliases)
+        blocks, args, typemap, func_ir, alias_map, arg_aliases)
     unwrap_parfor_blocks(parfor)
     return
 
@@ -2609,6 +2858,7 @@ def simplify_parfor_body_CFG(blocks):
             if isinstance(stmt, Parfor):
                 parfor = stmt
                 # add dummy return to enable CFG creation
+                # can't use dummy_return_in_loop_body since body changes
                 last_block = parfor.loop_body[max(parfor.loop_body.keys())]
                 last_block.body.append(ir.Return(0, ir.Loc("parfors_dummy", -1)))
                 parfor.loop_body = simplify_CFG(parfor.loop_body)
@@ -2690,7 +2940,7 @@ def get_copies_parfor(parfor, typemap):
 ir_utils.copy_propagate_extensions[Parfor] = get_copies_parfor
 
 
-def apply_copies_parfor(parfor, var_dict, name_var_table, ext_func, ext_data,
+def apply_copies_parfor(parfor, var_dict, name_var_table,
                         typemap, calltypes, save_copies):
     """apply copy propagate recursively in parfor"""
     # replace variables in pattern metadata like stencil neighborhood
@@ -2714,7 +2964,7 @@ def apply_copies_parfor(parfor, var_dict, name_var_table, ext_func, ext_data,
     blocks[0].body = assign_list + blocks[0].body
     in_copies_parfor, out_copies_parfor = copy_propagate(blocks, typemap)
     apply_copy_propagate(blocks, in_copies_parfor, name_var_table, typemap,
-                         calltypes, ext_func, ext_data, save_copies)
+                         calltypes, save_copies)
     unwrap_parfor_blocks(parfor)
     # remove dummy assignments
     blocks[0].body = blocks[0].body[len(assign_list):]
@@ -2787,6 +3037,12 @@ def repr_arrayexpr(arrayexpr):
     """
     if isinstance(arrayexpr, tuple):
         opr = arrayexpr[0]
+        # sometimes opr is not string like '+', but is a ufunc object
+        if not isinstance(opr, str):
+            if hasattr(opr, '__name__'):
+                opr = opr.__name__
+            else:
+                opr = '_'  # can return dummy since repr is not critical
         args = arrayexpr[1]
         if len(args) == 1:
             return '({}{})'.format(opr, repr_arrayexpr(args[0]))
@@ -2886,6 +3142,31 @@ def parfor_typeinfer(parfor, typeinferer):
 
 
 typeinfer.typeinfer_extensions[Parfor] = parfor_typeinfer
+
+def build_parfor_definitions(parfor, definitions=None):
+    """get variable definition table for parfors"""
+    if definitions is None:
+        definitions = defaultdict(list)
+
+    # avoid wrap_parfor_blocks() since build_definitions is called inside
+    # find_potential_aliases_parfor where the parfor is already wrapped
+    build_definitions(parfor.loop_body, definitions)
+    build_definitions({0: parfor.init_block}, definitions)
+    return definitions
+
+ir_utils.build_defs_extensions[Parfor] = build_parfor_definitions
+
+@contextmanager
+def dummy_return_in_loop_body(loop_body):
+    """adds dummy return to last block of parfor loop body for CFG computation
+    """
+    # max is last block since we add it manually for prange
+    last_label = max(loop_body.keys())
+    loop_body[last_label].body.append(
+        ir.Return(0, ir.Loc("parfors_dummy", -1)))
+    yield
+    # remove dummy return
+    loop_body[last_label].body.pop()
 
 @infer_global(reduce)
 class ReduceInfer(AbstractTemplate):

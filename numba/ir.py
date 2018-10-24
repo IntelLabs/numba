@@ -2,25 +2,35 @@ from __future__ import print_function, division, absolute_import
 
 from collections import defaultdict
 import copy
+import itertools
 import os
+import linecache
 import pprint
+import re
 import sys
+import warnings
+from numba import config, errors
+import operator
 
-from . import utils
+from .utils import BINOPS_TO_OPERATORS, INPLACE_BINOPS_TO_OPERATORS, UNARY_BUITINS_TO_OPERATORS, OPERATORS_TO_BUILTINS
 from .errors import (NotDefinedError, RedefinedError, VerificationError,
                      ConstantInferenceError)
-from numba import config
+
+# terminal color markup
+_termcolor = errors.termcolor()
 
 
 class Loc(object):
     """Source location
 
     """
+    _defmatcher = re.compile('def\s+(\w+)\(.*')
 
     def __init__(self, filename, line, col=None):
         self.filename = filename
         self.line = line
         self.col = col
+        self.lines = None # the source lines from the linecache
 
     @classmethod
     def from_function_id(cls, func_id):
@@ -36,16 +46,95 @@ class Loc(object):
         else:
             return "%s (%s)" % (self.filename, self.line)
 
-    def strformat(self):
+    def _find_definition(self):
+        # try and find a def, go backwards from error line
+        fn_name = None
+        lines = self._get_lines()
+        for x in reversed(lines[:self.line - 1]):
+            if 'def ' in x:
+                fn_name = x
+                break
+
+        return fn_name
+
+    def _raw_function_name(self):
+        defn = self._find_definition()
+        return self._defmatcher.match(defn.strip()).groups()[0]
+
+    def _get_lines(self):
+        if self.lines is None:
+
+            self.lines = linecache.getlines(self._get_path())
+
+        return self.lines
+
+    def _get_path(self):
+        path = None
         try:
             # Try to get a relative path
+            # ipython/jupyter input just returns as self.filename
             path = os.path.relpath(self.filename)
         except ValueError:
-            # Fallback to absolute path if error occured in getting the
+            # Fallback to absolute path if error occurred in getting the
             # relative path.
             # This may happen on windows if the drive is different
             path = os.path.abspath(self.filename)
-        return 'File "%s", line %d' % (path, self.line)
+        return path
+
+
+    def strformat(self, nlines_up=2):
+
+        lines = self._get_lines()
+
+        ret = [] # accumulates output
+        if lines and self.line:
+
+            def count_spaces(string):
+                spaces = 0
+                for x in itertools.takewhile(str.isspace, str(string)):
+                    spaces += 1
+                return spaces
+
+            # A few places in the code still use no `loc` or default to line 1
+            # this is often in places where exceptions are used for the purposes
+            # of flow control. As a result max is in use to prevent slice from
+            # `[negative: positive]`
+            selected = lines[max(0, self.line - nlines_up):self.line]
+
+            # see if selected contains a definition
+            def_found = False
+            for x in selected:
+                if 'def ' in x:
+                    def_found = True
+
+            # no definition found, try and find one
+            if not def_found:
+                # try and find a def, go backwards from error line
+                fn_name = None
+                for x in reversed(lines[:self.line - 1]):
+                    if 'def ' in x:
+                        fn_name = x
+                        break
+                if fn_name:
+                    ret.append(fn_name)
+                    spaces = count_spaces(x)
+                    ret.append(' '*(4 + spaces) + '<source elided>\n')
+
+            if selected:
+                ret.extend(selected[:-1])
+                ret.append(_termcolor.highlight(selected[-1]))
+
+                # point at the problem with a caret
+                spaces = count_spaces(selected[-1])
+                ret.append(' '*(spaces) + _termcolor.indicate("^"))
+
+        # if in the REPL source may not be available
+        if not ret:
+            ret = "<source missing, REPL in use?>"
+
+        err = _termcolor.filename('\nFile "%s", line %d:')+'\n%s'
+        tmp = err % (self._get_path(), self.line, _termcolor.code(''.join(ret)))
+        return tmp
 
     def with_lineno(self, line, col=None):
         """
@@ -174,12 +263,15 @@ class Expr(Inst):
 
     @classmethod
     def binop(cls, fn, lhs, rhs, loc):
+        assert not isinstance(fn, str)
         op = 'binop'
         return cls(op=op, loc=loc, fn=fn, lhs=lhs, rhs=rhs,
                    static_lhs=UNDEFINED, static_rhs=UNDEFINED)
 
     @classmethod
     def inplace_binop(cls, fn, immutable_fn, lhs, rhs, loc):
+        assert not isinstance(fn, str)
+        assert not isinstance(immutable_fn, str)
         op = 'inplace_binop'
         return cls(op=op, loc=loc, fn=fn, immutable_fn=immutable_fn,
                    lhs=lhs, rhs=rhs,
@@ -188,6 +280,7 @@ class Expr(Inst):
     @classmethod
     def unary(cls, fn, value, loc):
         op = 'unary'
+        fn = UNARY_BUITINS_TO_OPERATORS.get(fn, fn)
         return cls(op=op, loc=loc, fn=fn, value=value)
 
     @classmethod
@@ -282,7 +375,11 @@ class Expr(Inst):
             arglist = ', '.join(filter(None, [args, vararg, kws]))
             return 'call %s(%s)' % (self.func, arglist)
         elif self.op == 'binop':
-            return '%s %s %s' % (self.lhs, self.fn, self.rhs)
+            lhs, rhs = self.lhs, self.rhs
+            if self.fn == operator.contains:
+                lhs, rhs = rhs, lhs
+            fn = OPERATORS_TO_BUILTINS.get(self.fn, self.fn)
+            return '%s %s %s' % (lhs, fn, rhs)
         else:
             pres_order = self._kws.items() if config.DIFF_IR == 0 else sorted(self._kws.items())
             args = ('%s=%s' % (k, v) for k, v in pres_order)
@@ -292,7 +389,7 @@ class Expr(Inst):
         return self._rec_list_vars(self._kws)
 
     def infer_constant(self):
-        raise ConstantInferenceError("cannot make a constant of %s" % (self,))
+        raise ConstantInferenceError('%s' % self, loc=self.loc)
 
 
 class SetItem(Stmt):
@@ -513,6 +610,31 @@ class Yield(Inst):
         return [self.value]
 
 
+class EnterWith(Stmt):
+    """Enter a "with" context
+    """
+    def __init__(self, contextmanager, begin, end, loc):
+        """
+        Parameters
+        ----------
+        contextmanager : IR value
+        begin, end : int
+            The beginning and the ending offset of the with-body.
+        loc : int
+            Source location
+        """
+        self.contextmanager = contextmanager
+        self.begin = begin
+        self.end = end
+        self.loc = loc
+
+    def __str__(self):
+        return 'enter_with {}'.format(self.contextmanager)
+
+    def list_vars(self):
+        return [self.contextmanager]
+
+
 class Arg(object):
     def __init__(self, name, index, loc):
         self.name = name
@@ -523,7 +645,7 @@ class Arg(object):
         return 'arg(%d, name=%s)' % (self.index, self.name)
 
     def infer_constant(self):
-        raise ConstantInferenceError("cannot make a constant of %s" % (self,))
+        raise ConstantInferenceError('%s' % self, loc=self.loc)
 
 
 class Const(object):
@@ -823,6 +945,8 @@ class Block(object):
 
 
 class Loop(object):
+    """Describes a loop-block
+    """
     __slots__ = "entry", "exit"
 
     def __init__(self, entry, exit):
@@ -832,6 +956,20 @@ class Loop(object):
     def __repr__(self):
         args = self.entry, self.exit
         return "Loop(entry=%s, exit=%s)" % args
+
+
+class With(object):
+    """Describes a with-block
+    """
+    __slots__ = "entry", "exit"
+
+    def __init__(self, entry, exit):
+        self.entry = entry
+        self.exit = exit
+
+    def __repr__(self):
+        args = self.entry, self.exit
+        return "With(entry=%s, exit=%s)" % args
 
 
 class FunctionIR(object):
@@ -869,7 +1007,6 @@ class FunctionIR(object):
         Post-processing will have to be run again on the new IR.
         """
         firstblock = blocks[min(blocks)]
-        is_generator = self.is_generator and not force_non_generator
 
         new_ir = copy.copy(self)
         new_ir.blocks = blocks
@@ -881,7 +1018,8 @@ class FunctionIR(object):
         if arg_names is not None:
             new_ir.arg_names = arg_names
         new_ir._reset_analysis_variables()
-
+        # Make fresh func_id
+        new_ir.func_id = new_ir.func_id.derive()
         return new_ir
 
     def copy(self):
@@ -955,4 +1093,8 @@ class FunctionIR(object):
 
 
 # A stub for undefined global reference
-UNDEFINED = object()
+class UndefinedType(object):
+    def __repr__(self):
+        return "Undefined"
+
+UNDEFINED = UndefinedType()
