@@ -5,24 +5,22 @@ from collections import namedtuple, defaultdict
 import sys
 import warnings
 import traceback
-import threading
 from .tracing import event
 
 from numba import (bytecode, interpreter, funcdesc, postproc,
-                   typing, typeinfer, lowering, objmode, utils, config,
+                   typing, typeinfer, lowering, pylowering, utils, config,
                    errors, types, ir, rewrites, transforms)
 from numba.targets import cpu, callconv
 from numba.annotations import type_annotations
-from numba.parfor import PreParforPass, ParforPass, Parfor
+from numba.parfor import PreParforPass, ParforPass, Parfor, ParforDiagnostics
 from numba.inline_closurecall import InlineClosureCallPass
 from numba.errors import CompilerError
 from numba.ir_utils import raise_on_unsupported_feature
+from numba.compiler_lock import global_compiler_lock
+from numba.analysis import dead_branch_prune
 
 # terminal color markup
 _termcolor = errors.termcolor()
-
-# Lock for the preventing multiple compiler execution
-lock_compiler = threading.RLock()
 
 
 class Flags(utils.ConfigOptions):
@@ -74,7 +72,7 @@ CR_FIELDS = ["typing_context",
              "library",
              "call_helper",
              "environment",
-             "has_dynamic_globals"]
+             "metadata",]
 
 
 class CompileResult(namedtuple("_CompileResult", CR_FIELDS)):
@@ -112,7 +110,7 @@ class CompileResult(namedtuple("_CompileResult", CR_FIELDS)):
                  lifted=lifted,
                  typing_error=None,
                  call_helper=None,
-                 has_dynamic_globals=False,  # by definition
+                 metadata=None, # Do not store, arbitrary and potentially large!
                  )
         return cr
 
@@ -122,7 +120,6 @@ _LowerResult = namedtuple("_LowerResult", [
     "call_helper",
     "cfunc",
     "env",
-    "has_dynamic_globals",
 ])
 
 
@@ -156,7 +153,7 @@ def compile_isolated(func, args, return_type=None, flags=DEFAULT_FLAGS,
     # Register the contexts in case for nested @jit or @overload calls
     with cpu_target.nested_context(typingctx, targetctx):
         return compile_extra(typingctx, targetctx, func, args, return_type,
-                             flags, locals)
+                            flags, locals)
 
 
 def run_frontend(func):
@@ -235,6 +232,7 @@ class _PipelineManager(object):
         exc.args = (newmsg,)
         return exc
 
+    @global_compiler_lock
     def run(self, status):
         assert self._finalized, "PM must be finalized before run()"
         for pipeline_name in self.pipeline_order:
@@ -247,7 +245,8 @@ class _PipelineManager(object):
                 except _EarlyPipelineCompletion as e:
                     return e.result
                 except BaseException as e:
-                    msg = "Failed at %s (%s)" % (pipeline_name, stage_name)
+                    msg = "Failed in %s mode pipeline (step: %s)" % \
+                        (pipeline_name, stage_name)
                     patched_exception = self._patch_error(msg, e)
                     # No more fallback pipelines?
                     if is_final_pipeline:
@@ -292,6 +291,11 @@ class BasePipeline(object):
         self.typemap = None
         self.calltypes = None
         self.type_annotation = None
+        self.metadata = {} # holds arbitrary inter-pipeline stage meta data
+
+        # parfor diagnostics info, add to metadata
+        self.parfor_diagnostics = ParforDiagnostics()
+        self.metadata['parfor_diagnostics'] = self.parfor_diagnostics
 
         self.status = _CompileStatus(
             can_fallback=self.flags.enable_pyobject,
@@ -429,6 +433,25 @@ class BasePipeline(object):
                               lifted=tuple(loops), lifted_from=None)
             return cres
 
+    def stage_frontend_withlift(self):
+        """
+        Extract with-contexts
+        """
+        main, withs = transforms.with_lifting(
+            func_ir=self.func_ir,
+            typingctx=self.typingctx,
+            targetctx=self.targetctx,
+            flags=self.flags,
+            locals=self.locals,
+            )
+        if withs:
+            cres = compile_ir(self.typingctx, self.targetctx, main,
+                              self.args, self.return_type,
+                              self.flags, self.locals,
+                              lifted=tuple(withs), lifted_from=None,
+                              pipeline_class=type(self))
+            raise _EarlyPipelineCompletion(cres)
+
     def stage_objectmode_frontend(self):
         """
         Front-end: Analyze bytecode, generate Numba IR, infer types
@@ -444,6 +467,23 @@ class BasePipeline(object):
         self.typemap = defaultdict(lambda: types.pyobject)
         self.calltypes = defaultdict(lambda: types.pyobject)
         self.return_type = types.pyobject
+
+    def stage_dead_branch_prune(self):
+        """
+        This prunes dead branches, a dead branch is one which is derivable as
+        not taken at compile time purely based on const/literal evaluation.
+        """
+        assert self.func_ir
+        msg = ('Internal error in pre-inference dead branch pruning '
+               'pass encountered during compilation of '
+               'function "%s"' % (self.func_id.func_name,))
+        with self.fallback_context(msg):
+            dead_branch_prune(self.func_ir, self.args)
+
+        if config.DEBUG or config.DUMP_IR:
+            print('branch_pruned_ir'.center(80, '-'))
+            print(self.func_ir.dump())
+            print('end branch_pruned_ir'.center(80, '-'))
 
     def stage_nopython_frontend(self):
         """
@@ -506,8 +546,10 @@ class BasePipeline(object):
             self.func_ir,
             self.type_annotation.typemap,
             self.type_annotation.calltypes, self.typingctx,
-            self.flags.auto_parallel
+            self.flags.auto_parallel,
+            self.parfor_diagnostics.replaced_fns
             )
+
         preparfor_pass.run()
 
     def stage_parfor_pass(self):
@@ -518,7 +560,7 @@ class BasePipeline(object):
         assert self.func_ir
         parfor_pass = ParforPass(self.func_ir, self.type_annotation.typemap,
             self.type_annotation.calltypes, self.return_type, self.typingctx,
-            self.flags.auto_parallel, self.flags)
+            self.flags.auto_parallel, self.flags, self.parfor_diagnostics)
         parfor_pass.run()
 
         if config.WARNINGS:
@@ -552,7 +594,8 @@ class BasePipeline(object):
         # Ensure we have an IR and type information.
         assert self.func_ir
         inline_pass = InlineClosureCallPass(self.func_ir,
-                                            self.flags.auto_parallel)
+                                            self.flags.auto_parallel,
+                                            self.parfor_diagnostics.replaced_fns)
         inline_pass.run()
         # Remove all Dels, and re-run postproc
         post_proc = postproc.PostProcessor(self.func_ir)
@@ -585,6 +628,14 @@ class BasePipeline(object):
             with open(config.HTML, 'w') as fout:
                 self.type_annotation.html_annotate(fout)
 
+    def stage_dump_diagnostics(self):
+        if self.flags.auto_parallel.enabled:
+            if config.PARALLEL_DIAGNOSTICS:
+                if self.parfor_diagnostics is not None:
+                    self.parfor_diagnostics.dump(config.PARALLEL_DIAGNOSTICS)
+                else:
+                    raise RuntimeError("Diagnostics failed.")
+
     def backend_object_mode(self):
         """
         Object mode compilation
@@ -613,7 +664,8 @@ class BasePipeline(object):
                 self.typemap,
                 self.return_type,
                 self.calltypes,
-                self.flags)
+                self.flags,
+                self.metadata)
 
     def _backend(self, lowerfn, objectmode):
         """
@@ -642,7 +694,7 @@ class BasePipeline(object):
             lifted=self.lifted,
             fndesc=lowered.fndesc,
             environment=lowered.env,
-            has_dynamic_globals=lowered.has_dynamic_globals,
+            metadata=self.metadata,
             )
 
     def stage_objectmode_backend(self):
@@ -725,6 +777,7 @@ class BasePipeline(object):
                 pm.add_stage(self.stage_preserve_ir,
                              "preserve IR for fallback")
             pm.add_stage(self.stage_generic_rewrites, "nopython rewrites")
+            pm.add_stage(self.stage_dead_branch_prune, "dead branch pruning")
         pm.add_stage(self.stage_inline_pass,
                      "inline calls to locally defined closures")
 
@@ -755,17 +808,22 @@ class BasePipeline(object):
         """
         pm.add_stage(self.stage_cleanup, "cleanup intermediate results")
 
+    def add_with_handling_stage(self, pm):
+        pm.add_stage(self.stage_frontend_withlift, "Handle with contexts")
+
     def define_nopython_pipeline(self, pm, name='nopython'):
         """Add the nopython-mode pipeline to the pipeline manager
         """
         pm.create_pipeline(name)
         self.add_preprocessing_stage(pm)
+        self.add_with_handling_stage(pm)
         self.add_pre_typing_stage(pm)
         self.add_typing_stage(pm)
         self.add_optimization_stage(pm)
         pm.add_stage(self.stage_ir_legalization,
                      "ensure IR is legal prior to lowering")
         self.add_lowering_stage(pm)
+        pm.add_stage(self.stage_dump_diagnostics, "dump diagnostics")
         self.add_cleanup_stage(pm)
 
     def define_objectmode_pipeline(self, pm, name='object'):
@@ -775,6 +833,8 @@ class BasePipeline(object):
         self.add_preprocessing_stage(pm)
         pm.add_stage(self.stage_objectmode_frontend,
                      "object mode frontend")
+        pm.add_stage(self.stage_inline_pass,
+                     "inline calls to locally defined closures")
         pm.add_stage(self.stage_annotate_type, "annotate type")
         pm.add_stage(self.stage_ir_legalization,
                      "ensure IR is legal prior to lowering")
@@ -882,15 +942,16 @@ def compile_extra(typingctx, targetctx, func, args, return_type, flags,
 
 
 def compile_ir(typingctx, targetctx, func_ir, args, return_type, flags,
-               locals, lifted=(), lifted_from=None, library=None):
+               locals, lifted=(), lifted_from=None, library=None,
+               pipeline_class=Pipeline):
     """
     Compile a function with the given IR.
 
     For internal use only.
     """
 
-    pipeline = Pipeline(typingctx, targetctx, library,
-                        args, return_type, flags, locals)
+    pipeline = pipeline_class(typingctx, targetctx, library,
+                              args, return_type, flags, locals)
     return pipeline.compile_ir(func_ir=func_ir, lifted=lifted,
                                lifted_from=lifted_from)
 
@@ -990,52 +1051,49 @@ def type_inference_stage(typingctx, interp, args, return_type, locals={}):
 
 
 def native_lowering_stage(targetctx, library, interp, typemap, restype,
-                          calltypes, flags):
+                          calltypes, flags, metadata):
     # Lowering
     fndesc = funcdesc.PythonFunctionDescriptor.from_specialized_function(
         interp, typemap, restype, calltypes, mangler=targetctx.mangler,
         inline=flags.forceinline, noalias=flags.noalias)
 
-    lower = lowering.Lower(targetctx, library, fndesc, interp)
-    lower.lower()
-    if not flags.no_cpython_wrapper:
-        lower.create_cpython_wrapper(flags.release_gil)
-    env = lower.env
-    call_helper = lower.call_helper
-    has_dynamic_globals = lower.has_dynamic_globals
-    del lower
+    with targetctx.push_code_library(library):
+        lower = lowering.Lower(targetctx, library, fndesc, interp,
+                               metadata=metadata)
+        lower.lower()
+        if not flags.no_cpython_wrapper:
+            lower.create_cpython_wrapper(flags.release_gil)
+        env = lower.env
+        call_helper = lower.call_helper
+        del lower
 
     if flags.no_compile:
-        return _LowerResult(fndesc, call_helper, cfunc=None, env=env,
-                            has_dynamic_globals=has_dynamic_globals)
+        return _LowerResult(fndesc, call_helper, cfunc=None, env=env)
     else:
         # Prepare for execution
         cfunc = targetctx.get_executable(library, fndesc, env)
         # Insert native function for use by other jitted-functions.
         # We also register its library to allow for inlining.
         targetctx.insert_user_function(cfunc, fndesc, [library])
-        return _LowerResult(fndesc, call_helper, cfunc=cfunc, env=env,
-                            has_dynamic_globals=has_dynamic_globals)
+        return _LowerResult(fndesc, call_helper, cfunc=cfunc, env=env)
 
 
 def py_lowering_stage(targetctx, library, interp, flags):
     fndesc = funcdesc.PythonFunctionDescriptor.from_object_mode_function(
         interp
         )
-    lower = objmode.PyLower(targetctx, library, fndesc, interp)
-    lower.lower()
-    if not flags.no_cpython_wrapper:
-        lower.create_cpython_wrapper()
-    env = lower.env
-    call_helper = lower.call_helper
-    has_dynamic_globals = lower.has_dynamic_globals
-    del lower
+    with targetctx.push_code_library(library):
+        lower = pylowering.PyLower(targetctx, library, fndesc, interp)
+        lower.lower()
+        if not flags.no_cpython_wrapper:
+            lower.create_cpython_wrapper()
+        env = lower.env
+        call_helper = lower.call_helper
+        del lower
 
     if flags.no_compile:
-        return _LowerResult(fndesc, call_helper, cfunc=None, env=env,
-                            has_dynamic_globals=has_dynamic_globals)
+        return _LowerResult(fndesc, call_helper, cfunc=None, env=env)
     else:
         # Prepare for execution
         cfunc = targetctx.get_executable(library, fndesc, env)
-        return _LowerResult(fndesc, call_helper, cfunc=cfunc, env=env,
-                            has_dynamic_globals=has_dynamic_globals)
+        return _LowerResult(fndesc, call_helper, cfunc=cfunc, env=env)

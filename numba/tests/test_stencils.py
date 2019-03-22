@@ -88,6 +88,8 @@ if not _unsupported:
 
 class TestStencilBase(unittest.TestCase):
 
+    _numba_parallel_test_ = False
+
     def __init__(self, *args):
         # flags for njit()
         self.cflags = Flags()
@@ -429,6 +431,87 @@ class TestStencil(TestStencilBase):
 
     @skip_unsupported
     @tag('important')
+    def test_stencil_call_const(self):
+        """Tests numba.stencil call that has an index that can be inferred as
+        constant from a unary expr. Otherwise, this would raise an error since
+        neighborhood length is not specified.
+        """
+        def test_impl1(n):
+            A = np.arange(n)
+            B = np.zeros(n)
+            c = 1
+            numba.stencil(lambda a,c : 0.3 * (a[-c] + a[0] + a[c]))(
+                                                                   A, c, out=B)
+            return B
+
+        def test_impl2(n):
+            A = np.arange(n)
+            B = np.zeros(n)
+            c = 2
+            numba.stencil(lambda a,c : 0.3 * (a[1-c] + a[0] + a[c-1]))(
+                                                                   A, c, out=B)
+            return B
+
+        # recursive expr case
+        def test_impl3(n):
+            A = np.arange(n)
+            B = np.zeros(n)
+            c = 2
+            numba.stencil(lambda a,c : 0.3 * (a[-c+1] + a[0] + a[c-1]))(
+                                                                   A, c, out=B)
+            return B
+
+        # multi-constant case
+        def test_impl4(n):
+            A = np.arange(n)
+            B = np.zeros(n)
+            d = 1
+            c = 2
+            numba.stencil(lambda a,c,d : 0.3 * (a[-c+d] + a[0] + a[c-d]))(
+                                                                A, c, d, out=B)
+            return B
+
+        def test_impl_seq(n):
+            A = np.arange(n)
+            B = np.zeros(n)
+            c = 1
+            for i in range(1, n - 1):
+                B[i] = 0.3 * (A[i - c] + A[i] + A[i + c])
+            return B
+
+        n = 100
+        # constant inference is only possible in parallel path
+        cpfunc1 = self.compile_parallel(test_impl1, (types.intp,))
+        cpfunc2 = self.compile_parallel(test_impl2, (types.intp,))
+        cpfunc3 = self.compile_parallel(test_impl3, (types.intp,))
+        cpfunc4 = self.compile_parallel(test_impl4, (types.intp,))
+        expected = test_impl_seq(n)
+        # parfor result
+        parfor_output1 = cpfunc1.entry_point(n)
+        parfor_output2 = cpfunc2.entry_point(n)
+        parfor_output3 = cpfunc3.entry_point(n)
+        parfor_output4 = cpfunc4.entry_point(n)
+        np.testing.assert_almost_equal(parfor_output1, expected, decimal=3)
+        np.testing.assert_almost_equal(parfor_output2, expected, decimal=3)
+        np.testing.assert_almost_equal(parfor_output3, expected, decimal=3)
+        np.testing.assert_almost_equal(parfor_output4, expected, decimal=3)
+
+        # check error in regular Python path
+        with self.assertRaises(ValueError) as e:
+            test_impl4(4)
+
+        self.assertIn("stencil kernel index is not constant, "
+                      "'neighborhood' option required", str(e.exception))
+        # check error in njit path
+        # TODO: ValueError should be thrown instead of LoweringError
+        with self.assertRaises(LoweringError) as e:
+            njit(test_impl4)(4)
+
+        self.assertIn("stencil kernel index is not constant, "
+                      "'neighborhood' option required", str(e.exception))
+
+    @skip_unsupported
+    @tag('important')
     def test_stencil_parallel_off(self):
         """Tests 1D numba.stencil calls without parallel translation
            turned off.
@@ -439,6 +522,61 @@ class TestStencil(TestStencilBase):
         cpfunc = self.compile_parallel(test_impl, (numba.float64[:],), stencil=False)
         self.assertNotIn('@do_scheduling', cpfunc.library.get_llvm_str())
 
+    @skip_unsupported
+    def test_out_kwarg_w_cval(self):
+        """ Issue #3518, out kwarg did not work with cval."""
+        # test const value that matches the arg dtype, and one that can be cast
+        const_vals = [7, 7.0]
+
+        def kernel(a):
+            return (a[0, 0] - a[1, 0])
+
+        for const_val in const_vals:
+            stencil_fn = numba.stencil(kernel, cval=const_val)
+
+            def wrapped():
+                A = np.arange(12).reshape((3, 4))
+                ret = np.ones_like(A)
+                stencil_fn(A, out=ret)
+                return ret
+
+            # stencil function case
+            A = np.arange(12).reshape((3, 4))
+            expected = np.full_like(A, -4)
+            expected[-1, :] = const_val
+            ret = np.ones_like(A)
+            stencil_fn(A, out=ret)
+            np.testing.assert_almost_equal(ret, expected)
+
+            # wrapped function case, check njit, then njit(parallel=True)
+            impls = self.compile_all(wrapped,)
+            for impl in impls:
+                got = impl.entry_point()
+                np.testing.assert_almost_equal(got, expected)
+
+        # now check exceptions for cval dtype mismatch with out kwarg dtype
+        stencil_fn = numba.stencil(kernel, cval=1j)
+
+        def wrapped():
+            A = np.arange(12).reshape((3, 4))
+            ret = np.ones_like(A)
+            stencil_fn(A, out=ret)
+            return ret
+
+        A = np.arange(12).reshape((3, 4))
+        ret = np.ones_like(A)
+        with self.assertRaises(ValueError) as e:
+            stencil_fn(A, out=ret)
+        msg = "cval type does not match stencil return type."
+        self.assertIn(msg, str(e.exception))
+
+        for compiler in [self.compile_njit, self.compile_parallel]:
+            try:
+                compiler(wrapped,())
+            except(ValueError, LoweringError) as e:
+                self.assertIn(msg, str(e))
+            else:
+                raise AssertionError("Expected error was not raised")
 
 
 class pyStencilGenerator:
@@ -576,6 +714,9 @@ class pyStencilGenerator:
             """
             Generates an ast.Num of value `value`
             """
+            # pretend bools are ints, ast has no boolean literal support
+            if isinstance(value, bool):
+                return ast.Num(int(value))
             if abs(value) >= 0:
                 return ast.Num(value)
             else:
@@ -2396,6 +2537,36 @@ class TestManyStencils(TestStencilBase):
                 'neighborhood': (
                     (-3, 0), (-3, 0)), 'standard_indexing': 'b', 'cval': 1.5})
 
+    def test_basic91(self):
+        """ Issue #3454, const(int) == const(int) evaluating incorrectly. """
+        def kernel(a):
+            b = 0
+            if(2 == 0):
+                b = 2
+            return a[0, 0] + b
+
+        a = np.arange(10. * 20.).reshape(10, 20)
+        self.check(kernel, a)
+
+    def test_basic92(self):
+        """ Issue #3497, bool return type evaluating incorrectly. """
+        def kernel(a):
+            return (a[-1, -1] ^ a[-1, 0] ^ a[-1, 1] ^
+                    a[0, -1]  ^ a[0, 0]  ^ a[0, 1]  ^
+                    a[1, -1]  ^ a[1, 0]  ^ a[1, 1])
+
+        A = np.array(np.arange(20) % 2).reshape(4, 5).astype(np.bool_)
+        self.check(kernel, A)
+
+    def test_basic93(self):
+        """ Issue #3497, bool return type evaluating incorrectly. """
+        def kernel(a):
+            return (a[-1, -1] ^ a[-1, 0] ^ a[-1, 1] ^
+                    a[0, -1]  ^ a[0, 0]  ^ a[0, 1]  ^
+                    a[1, -1]  ^ a[1, 0]  ^ a[1, 1])
+
+        A = np.array(np.arange(20) % 2).reshape(4, 5).astype(np.bool_)
+        self.check(kernel, A, options={'cval': True})
 
 if __name__ == "__main__":
     unittest.main()

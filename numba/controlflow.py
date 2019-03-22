@@ -9,7 +9,7 @@ from numba import utils
 
 # List of bytecodes creating a new block in the control flow graph
 # (in addition to explicit jump labels).
-NEW_BLOCKERS = frozenset(['SETUP_LOOP', 'FOR_ITER'])
+NEW_BLOCKERS = frozenset(['SETUP_LOOP', 'FOR_ITER', 'SETUP_WITH'])
 
 
 class CFBlock(object):
@@ -234,6 +234,8 @@ class CFGraph(object):
         pprint.pprint(self._loops, stream=file)
         print("CFG node-to-loops:", file=file)
         pprint.pprint(self._in_loops, stream=file)
+        print("CFG backbone:", file=file)
+        pprint.pprint(self.backbone(), stream=file)
 
     # Internal APIs
 
@@ -443,7 +445,7 @@ class CFGraph(object):
         self._in_loops = in_loops
 
     def _dump_adj_lists(self, file):
-        adj_lists = dict((src, list(dests))
+        adj_lists = dict((src, sorted(list(dests)))
                          for src, dests in self._succs.items())
         import pprint
         pprint.pprint(adj_lists, stream=file)
@@ -478,6 +480,7 @@ class ControlFlowAnalysis(object):
         self._curblock = None
         self._blockstack = []
         self._loops = []
+        self._withs = []
 
     def iterblocks(self):
         """
@@ -594,6 +597,16 @@ class ControlFlowAnalysis(object):
         self._blockstack.append(end)
         self._loops.append((inst.offset, end))
         # TODO: Looplifting requires the loop entry be its own block.
+        #       Forcing a new block here is the simplest solution for now.
+        #       But, we should consider other less ad-hoc ways.
+        self.jump(inst.next)
+        self._force_new_block = True
+
+    def op_SETUP_WITH(self, inst):
+        end = inst.get_jump_target()
+        self._blockstack.append(end)
+        self._withs.append((inst.offset, end))
+        # TODO: WithLifting requires the loop entry be its own block.
         #       Forcing a new block here is the simplest solution for now.
         #       But, we should consider other less ad-hoc ways.
         self.jump(inst.next)

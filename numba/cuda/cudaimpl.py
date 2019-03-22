@@ -9,6 +9,7 @@ import llvmlite.binding as ll
 
 from numba.targets.imputils import Registry
 from numba import cgutils
+from numba import six
 from numba import types
 from .cudadrv import nvvm
 from . import nvvmutils, stubs
@@ -100,29 +101,13 @@ for sreg in nvvmutils.SREG_MAPPING.keys():
 def ptx_cmem_arylike(context, builder, sig, args):
     lmod = builder.module
     [arr] = args
-    flat = arr.flatten(order='A')
     aryty = sig.return_type
-    dtype = aryty.dtype
 
-    if isinstance(dtype, types.Complex):
-        elemtype = (types.float32
-                    if dtype == types.complex64
-                    else types.float64)
-        constvals = []
-        for i in range(flat.size):
-            elem = flat[i]
-            real = context.get_constant(elemtype, elem.real)
-            imag = context.get_constant(elemtype, elem.imag)
-            constvals.extend([real, imag])
-
-    elif dtype in types.number_domain:
-        constvals = [context.get_constant(dtype, flat[i])
-                     for i in range(flat.size)]
-
-    else:
-        raise TypeError("unsupport type: %s" % dtype)
-
-    constary = lc.Constant.array(constvals[0].type, constvals)
+    constvals = [
+        context.get_constant(types.byte, i)
+        for i in six.iterbytes(arr.tobytes(order='A'))
+    ]
+    constary = lc.Constant.array(Type.int(8), constvals)
 
     addrspace = nvvm.ADDRSPACE_CONSTANT
     gv = lmod.add_global_variable(constary.type, name="_cudapy_cmem",
@@ -130,6 +115,11 @@ def ptx_cmem_arylike(context, builder, sig, args):
     gv.linkage = lc.LINKAGE_INTERNAL
     gv.global_constant = True
     gv.initializer = constary
+
+    # Preserve the underlying alignment
+    lldtype = context.get_data_type(aryty.dtype)
+    align = context.get_abi_sizeof(lldtype)
+    gv.align = 2 ** (align - 1).bit_length()
 
     # Convert to generic address-space
     conv = nvvmutils.insert_addrspace_conv(lmod, Type.int(8), addrspace)
@@ -375,6 +365,11 @@ def ptx_match_all_sync(context, builder, sig, args):
 @lower(stubs.popc, types.Any)
 def ptx_popc(context, builder, sig, args):
     return builder.ctpop(args[0])
+
+
+@lower(stubs.fma, types.Any, types.Any, types.Any)
+def ptx_fma(context, builder, sig, args):
+    return builder.fma(*args)
 
 
 @lower(stubs.brev, types.u4)

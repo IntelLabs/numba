@@ -25,32 +25,6 @@ class TestErrorHandlingBeforeLowering(unittest.TestCase):
             expected = self.expected_msg % "<lambda>"
             self.assertIn(expected, str(raises.exception))
 
-    def test_unsupported_make_function_listcomp(self):
-        try:
-            @jit
-            def func(x):
-                a = [i for i in x]
-                return undefined_global  # force error
-
-            with self.assertRaises(errors.UnsupportedError) as raises:
-                func([1])
-
-            expected = self.expected_msg % "<listcomp>"
-            self.assertIn(expected, str(raises.exception))
-        except NameError: #py27 cannot handle the undefined global
-            self.assertTrue(utils.PY2)
-
-    def test_unsupported_make_function_dictcomp(self):
-        @jit
-        def func():
-            return {i:0 for i in range(1)}
-
-        with self.assertRaises(errors.UnsupportedError) as raises:
-            func()
-
-        expected = self.expected_msg % "<dictcomp>"
-        self.assertIn(expected, str(raises.exception))
-
     def test_unsupported_make_function_return_inner_func(self):
         def func(x):
             """ return the closure """
@@ -72,16 +46,85 @@ class TestErrorHandlingBeforeLowering(unittest.TestCase):
 class TestUnsupportedReporting(unittest.TestCase):
 
     def test_unsupported_numpy_function(self):
-        # np.asarray(list) currently unsupported
+        # np.asanyarray(list) currently unsupported
         @njit
         def func():
-            np.asarray([1,2,3])
+            np.asanyarray([1,2,3])
 
         with self.assertRaises(errors.TypingError) as raises:
             func()
 
-        expected = "Use of unsupported NumPy function 'numpy.asarray'"
+        expected = "Use of unsupported NumPy function 'numpy.asanyarray'"
         self.assertIn(expected, str(raises.exception))
+
+
+class TestMiscErrorHandling(unittest.TestCase):
+
+    def test_use_of_exception_for_flow_control(self):
+        # constant inference uses exceptions with no Loc specified to determine
+        # flow control, this asserts that the construction of the lowering
+        # error context handler works in the case of an exception with no Loc
+        # specified. See issue #3135.
+        @njit
+        def fn(x):
+            return 10**x
+
+        a = np.array([1.0],dtype=np.float64)
+        fn(a) # should not raise
+
+    def test_use_of_ir_unknown_loc(self):
+        # for context see # 3390
+        import numba
+        class TestPipeline(numba.compiler.BasePipeline):
+            def define_pipelines(self, pm):
+                pm.create_pipeline('test_loc')
+                self.add_preprocessing_stage(pm)
+                self.add_with_handling_stage(pm)
+                self.add_pre_typing_stage(pm)
+                # remove dead before type inference so that the Arg node is removed
+                # and the location of the arg cannot be found
+                pm.add_stage(self.rm_dead_stage,
+                            "remove dead before type inference for testing")
+                self.add_typing_stage(pm)
+                self.add_optimization_stage(pm)
+                pm.add_stage(self.stage_ir_legalization,
+                            "ensure IR is legal prior to lowering")
+                self.add_lowering_stage(pm)
+                self.add_cleanup_stage(pm)
+
+            def rm_dead_stage(self):
+                numba.ir_utils.remove_dead(
+                    self.func_ir.blocks, self.func_ir.arg_names, self.func_ir)
+
+        @numba.jit(pipeline_class=TestPipeline)
+        def f(a):
+            return 0
+
+        with self.assertRaises(errors.TypingError) as raises:
+            f(iter([1,2]))  # use a type that Numba doesn't recognize
+
+        expected = 'File "unknown location", line 0:'
+        self.assertIn(expected, str(raises.exception))
+
+
+class TestConstantInferenceErrorHandling(unittest.TestCase):
+
+    def test_basic_error(self):
+        # issue 3717
+        @njit
+        def problem(a,b):
+            if a == b:
+                raise Exception("Equal numbers: %i %i", a, b)
+            return a * b
+
+        with self.assertRaises(errors.ConstantInferenceError) as raises:
+            problem(1,2)
+
+        msg1 = "Constant inference not possible for: arg(0, name=a)"
+        msg2 = 'raise Exception("Equal numbers: %i %i", a, b)'
+        self.assertIn(msg1, str(raises.exception))
+        self.assertIn(msg2, str(raises.exception))
+
 
 if __name__ == '__main__':
     unittest.main()

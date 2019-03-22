@@ -7,7 +7,8 @@ import sys
 from collections import namedtuple
 
 from numba import unittest_support as unittest
-from numba import njit, typeof, types, typing, typeof, ir, utils, bytecode
+from numba import (njit, typeof, types, typing, typeof, ir, utils, bytecode,
+    jitclass, prange)
 from .support import TestCase, tag
 from numba.array_analysis import EquivSet, ArrayAnalysis
 from numba.compiler import Pipeline, Flags, _PipelineManager
@@ -21,6 +22,15 @@ _windows_py27 = (sys.platform.startswith('win32') and
 _32bit = sys.maxsize <= 2 ** 32
 _reason = 'parfors not supported'
 skip_unsupported = unittest.skipIf(_32bit or _windows_py27, _reason)
+
+
+# test class for #3700
+@jitclass([('L', types.int32), ('T', types.int32)])
+class ExampleClass3700(object):
+    def __init__(self, n):
+        self.L = n
+        self.T = n + 1
+
 
 class TestEquivSet(TestCase):
 
@@ -123,7 +133,7 @@ class ArrayAnalysisTester(Pipeline):
 
         pm.add_stage(stage_array_analysis, "analyze array equivalences")
         if test_idempotence:
-            # Do another pass of array analysis to test idempontence
+            # Do another pass of array analysis to test idempotence
             pm.add_stage(stage_array_analysis, "analyze array equivalences")
 
         pm.finalize()
@@ -166,7 +176,7 @@ class TestArrayAnalysis(TestCase):
                 fn = func_ir.get_definition(expr.func.name)
                 if isinstance(fn, ir.Global) and fn.name == 'assert_equiv':
                     typ = typemap[expr.args[0].name]
-                    if typ.value.startswith(msg):
+                    if typ.literal_value.startswith(msg):
                         return True
         return False
 
@@ -327,12 +337,28 @@ class TestArrayAnalysis(TestCase):
                                asserts=[self.with_assert('A', 'B'),
                                         self.without_assert('C', 'D')])
 
+        def test_tup_arg(T):
+            T2 = T
+            return T2[0]
+
+        int_arr_typ = types.Array(types.intp, 1, 'C')
+        self._compile_and_test(test_tup_arg,
+            (types.Tuple((int_arr_typ, int_arr_typ)),), asserts=None)
+
         T = namedtuple("T", ['a','b'])
         def test_namedtuple(n):
             r = T(n, n)
             return r[0]
         self._compile_and_test(test_namedtuple, (types.intp,),
                                 equivs=[self.with_equiv('r', ('n', 'n'))],)
+
+        # np.where is tricky since it returns tuple of arrays
+        def test_np_where_tup_return(A):
+            c = np.where(A)
+            return len(c[0])
+
+        self._compile_and_test(test_np_where_tup_return,
+            (types.Array(types.intp, 1, 'C'),), asserts=None)
 
         def test_shape(A):
             (m, n) = A.shape
@@ -520,6 +546,23 @@ class TestArrayAnalysis(TestCase):
         self._compile_and_test(test_8, (types.intp,),
                                asserts=[self.without_assert('B', 'C')],
                                idempotent=False)
+
+        def test_9(m):
+            # issues #3461 and #3554, checks equivalence on empty slices
+            # and across binop
+            A = np.zeros((m))
+            B = A[:0] # B = array([], dtype=int64)
+            C = A[1:]
+            D = A[:-1:-1] # D = array([], dtype=int64)
+            E = B + D
+            F = E
+            F += 1 # F = array([], dtype=int64)
+            return A, C, F
+        self._compile_and_test(test_9, (types.intp,),
+                               equivs=[self.without_equiv('B', 'C'),
+                                       self.with_equiv('A', 'm'),
+                                       self.with_equiv('B', 'D'),
+                                       self.with_equiv('F', 'D'),],)
 
     def test_numpy_calls(self):
         def test_zeros(n):
@@ -832,6 +875,13 @@ class TestArrayAnalysis(TestCase):
                                equivs=[self.with_equiv('a', 'c', 'e')],
                                asserts=None)
 
+class TestArrayAnalysisParallelRequired(TestCase):
+    """This is to just split out tests that need the parallel backend and
+    therefore serialised execution.
+    """
+
+    _numba_parallel_test_ = False
+
     @skip_unsupported
     def test_misc(self):
 
@@ -849,6 +899,35 @@ class TestArrayAnalysis(TestCase):
             njit(test_bug2537, parallel=True)(10)
         except IndexError:
             self.fail("test_bug2537 raised IndexError!")
+
+    @skip_unsupported
+    def test_global_namedtuple(self):
+        Row = namedtuple('Row', ['A'])
+        row = Row(3)
+
+        def test_impl():
+            rr = row
+            res = rr.A
+            if res == 2:
+                res = 3
+            return res
+
+        self.assertEqual(njit(test_impl, parallel=True)(), test_impl())
+
+    @skip_unsupported
+    def test_array_T_issue_3700(self):
+
+        def test_impl(t_obj, X):
+            for i in prange(t_obj.T):
+                X[i] = i
+            return X.sum()
+
+        n = 5
+        t_obj = ExampleClass3700(n)
+        X1 = np.zeros(t_obj.T)
+        X2 = np.zeros(t_obj.T)
+        self.assertEqual(
+            njit(test_impl, parallel=True)(t_obj, X1), test_impl(t_obj, X2))
 
 if __name__ == '__main__':
     unittest.main()

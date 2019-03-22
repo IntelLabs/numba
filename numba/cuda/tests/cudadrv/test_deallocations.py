@@ -38,14 +38,18 @@ class TestDeallocation(SerialMixin, unittest.TestCase):
         try:
             # change to a smaller ratio
             config.CUDA_DEALLOCS_RATIO = max_pending / mi.total
-            self.assertEqual(deallocs._max_pending_bytes, max_pending)
+            # due to round off error (floor is used in calculating _max_pending_bytes)
+            # it can be off by 1.
+            self.assertAlmostEqual(deallocs._max_pending_bytes, max_pending, delta=1)
 
-            # deallocate half the max size
+            # allocate half the max size
+            # this will not trigger deallocation
             cuda.to_device(np.ones(max_pending // 2, dtype=np.int8))
             self.assertEqual(len(deallocs), 1)
 
-            # deallocate another remaining
-            cuda.to_device(np.ones(max_pending - deallocs._size, dtype=np.int8))
+            # allocate another remaining
+            # this will not trigger deallocation
+            cuda.to_device(np.ones(deallocs._max_pending_bytes - deallocs._size, dtype=np.int8))
             self.assertEqual(len(deallocs), 2)
 
             # another byte to trigger .clear()
@@ -172,6 +176,61 @@ class TestDel(SerialMixin, unittest.TestCase):
         with self.check_ignored_exception(ctx):
             del mem
 
+    def test_pinned_contextmanager(self):
+        # Check that temporarily pinned memory is unregistered immediately,
+        # such that it can be re-pinned at any time
+        class PinnedException(Exception):
+            pass
+
+        arr = np.zeros(1)
+        ctx = cuda.current_context()
+        ctx.deallocations.clear()
+        with self.check_ignored_exception(ctx):
+            with cuda.pinned(arr):
+                pass
+            with cuda.pinned(arr):
+                pass
+            # Should also work inside a `defer_cleanup` block
+            with cuda.defer_cleanup():
+                with cuda.pinned(arr):
+                    pass
+                with cuda.pinned(arr):
+                    pass
+            # Should also work when breaking out of the block due to an exception
+            try:
+                with cuda.pinned(arr):
+                    raise PinnedException
+            except PinnedException:
+                with cuda.pinned(arr):
+                    pass
+
+    def test_mapped_contextmanager(self):
+        # Check that temporarily mapped memory is unregistered immediately,
+        # such that it can be re-mapped at any time
+        class MappedException(Exception):
+            pass
+
+        arr = np.zeros(1)
+        ctx = cuda.current_context()
+        ctx.deallocations.clear()
+        with self.check_ignored_exception(ctx):
+            with cuda.mapped(arr) as marr:
+                pass
+            with cuda.mapped(arr) as marr:
+                pass
+            # Should also work inside a `defer_cleanup` block
+            with cuda.defer_cleanup():
+                with cuda.mapped(arr) as marr:
+                    pass
+                with cuda.mapped(arr) as marr:
+                    pass
+            # Should also work when breaking out of the block due to an exception
+            try:
+                with cuda.mapped(arr) as marr:
+                    raise MappedException
+            except MappedException:
+                with cuda.mapped(arr) as marr:
+                    pass
 
 if __name__ == '__main__':
     unittest.main()

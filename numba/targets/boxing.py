@@ -28,6 +28,12 @@ def unbox_boolean(typ, obj, c):
     return NativeValue(val, is_error=c.pyapi.c_api_error())
 
 
+@box(types.IntegerLiteral)
+def box_literal_integer(typ, val, c):
+    val = c.context.cast(c.builder, val, typ, typ.literal_type)
+    return c.box(typ.literal_type, val)
+
+
 @box(types.Integer)
 def box_integer(typ, val, c):
     if typ.signed:
@@ -247,6 +253,17 @@ def unbox_charseq(typ, obj, c):
     return NativeValue(ret, is_error=c.builder.not_(ok))
 
 
+
+@box(types.Optional)
+def box_optional(typ, val, c):
+    optval = c.context.make_helper(c.builder, typ, val)
+    ret = cgutils.alloca_once_value(c.builder, c.pyapi.borrow_none())
+    with c.builder.if_then(optval.valid):
+        validres = c.box(typ.type, optval.data)
+        c.builder.store(validres, ret)
+    return c.builder.load(ret)
+
+
 @unbox(types.Optional)
 def unbox_optional(typ, obj, c):
     """
@@ -395,7 +412,26 @@ def unbox_array(typ, obj, c):
         errcode = c.pyapi.nrt_adapt_ndarray_from_python(obj, ptr)
     else:
         errcode = c.pyapi.numba_array_adaptor(obj, ptr)
-    failed = cgutils.is_not_null(c.builder, errcode)
+
+    # TODO: here we have minimal typechecking by the itemsize.
+    #       need to do better
+    try:
+        expected_itemsize = numpy_support.as_dtype(typ.dtype).itemsize
+    except NotImplementedError:
+        # Don't check types that can't be `as_dtype()`-ed
+        itemsize_mismatch = cgutils.false_bit
+    else:
+        expected_itemsize = nativeary.itemsize.type(expected_itemsize)
+        itemsize_mismatch = c.builder.icmp_unsigned(
+            '!=',
+            nativeary.itemsize,
+            expected_itemsize,
+            )
+
+    failed = c.builder.or_(
+        cgutils.is_not_null(c.builder, errcode),
+        itemsize_mismatch,
+    )
     # Handle error
     with c.builder.if_then(failed, likely=False):
         c.pyapi.err_set_string("PyExc_TypeError",
@@ -794,7 +830,7 @@ def _python_set_to_native(typ, obj, c, size, setptr, errorptr):
                 native = c.unbox(typ.dtype, itemobj)
                 with c.builder.if_then(native.is_error, likely=False):
                     c.builder.store(cgutils.true_bit, errorptr)
-                inst.add(native.value, do_resize=False)
+                inst.add_pyapi(c.pyapi, native.value, do_resize=False)
 
             if typ.reflected:
                 inst.parent = obj
@@ -944,6 +980,20 @@ def box_dtype(typ, val, c):
     np_dtype = numpy_support.as_dtype(typ.dtype)
     return c.pyapi.unserialize(c.pyapi.serialize_object(np_dtype))
 
+@unbox(types.DType)
+def unbox_dtype(typ, val, c):
+    return NativeValue(c.context.get_dummy_value())
+
+
+@box(types.NumberClass)
+def box_number_class(typ, val, c):
+    np_dtype = numpy_support.as_dtype(typ.dtype)
+    return c.pyapi.unserialize(c.pyapi.serialize_object(np_dtype))
+
+@unbox(types.NumberClass)
+def unbox_number_class(typ, val, c):
+    return NativeValue(c.context.get_dummy_value())
+
 
 @box(types.PyObject)
 @box(types.Object)
@@ -1006,7 +1056,7 @@ def unbox_dispatcher(typ, obj, c):
 def unbox_unsupported(typ, obj, c):
     c.pyapi.err_set_string("PyExc_TypeError",
                            "can't unbox {!r} type".format(typ))
-    res = c.pyapi.get_null_object()
+    res = c.context.get_constant_null(typ)
     return NativeValue(res, is_error=cgutils.true_bit)
 
 
@@ -1016,3 +1066,11 @@ def box_unsupported(typ, val, c):
     res = c.pyapi.get_null_object()
     return res
 
+
+@box(types.Literal)
+def box(typ, val, c):
+    # Const type contains the python object of the constant value,
+    # which we can directly return.
+    retval = typ.literal_value
+    # Serialize the value into the IR
+    return c.pyapi.unserialize(c.pyapi.serialize_object(retval))

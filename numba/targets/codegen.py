@@ -4,7 +4,6 @@ import warnings
 import functools
 import locale
 import weakref
-from collections import defaultdict
 import ctypes
 
 import llvmlite.llvmpy.core as lc
@@ -15,6 +14,7 @@ import llvmlite.ir as llvmir
 from numba import config, utils, cgutils
 from numba.runtime.nrtopt import remove_redundant_nrt_refct
 from numba.runtime import rtsys
+from numba.compiler_lock import require_global_compiler_lock
 
 _x86arch = frozenset(['x86', 'i386', 'i486', 'i586', 'i686', 'i786',
                       'i886', 'i986'])
@@ -81,6 +81,7 @@ class CodeLibrary(object):
 
     @property
     def has_dynamic_globals(self):
+        self._ensure_finalized()
         return len(self._dynamic_globals) > 0
 
     @property
@@ -186,16 +187,7 @@ class CodeLibrary(object):
         ll_module.verify()
         self.add_llvm_module(ll_module)
 
-    def _scan_dynamic_globals(self, ll_module):
-        """
-        Scan for dynanmic globals and track their names
-        """
-        for gv in ll_module.global_variables:
-            if gv.name.startswith("numba.dynamic.globals"):
-                self._dynamic_globals.append(gv.name)
-
     def add_llvm_module(self, ll_module):
-        self._scan_dynamic_globals(ll_module)
         self._optimize_functions(ll_module)
         # TODO: we shouldn't need to recreate the LLVM module object
         ll_module = remove_redundant_nrt_refct(ll_module)
@@ -207,6 +199,8 @@ class CodeLibrary(object):
         Finalization involves various stages of code optimization and
         linking.
         """
+        require_global_compiler_lock()
+
         # Report any LLVM-related problems to the user
         self._codegen._check_llvm_bugs()
 
@@ -219,9 +213,6 @@ class CodeLibrary(object):
         for library in self._linking_libraries:
             self._final_module.link_in(
                 library._get_module_for_linking(), preserve=True)
-        for library in self._codegen._libraries:
-            self._final_module.link_in(
-                library._get_module_for_linking(), preserve=True)
 
         # Optimize the module after all dependences are linked in above,
         # to allow for inlining.
@@ -230,10 +221,27 @@ class CodeLibrary(object):
         self._final_module.verify()
         self._finalize_final_module()
 
+    def _finalize_dyanmic_globals(self):
+        # Scan for dynamic globals
+        for gv in self._final_module.global_variables:
+            if gv.name.startswith('numba.dynamic.globals'):
+                self._dynamic_globals.append(gv.name)
+
+    def _verify_declare_only_symbols(self):
+        # Verify that no declare-only function compiled by numba.
+        for fn in self._final_module.functions:
+            # We will only check for symbol name starting with '_ZN5numba'
+            if fn.is_declaration and fn.name.startswith('_ZN5numba'):
+                msg = 'Symbol {} not linked properly'
+                raise AssertionError(msg.format(fn.name))
+
     def _finalize_final_module(self):
         """
         Make the underlying LLVM module ready to use.
         """
+        self._finalize_dyanmic_globals()
+        self._verify_declare_only_symbols()
+
         # Remember this on the module, for the object cache hooks
         self._final_module.__library = weakref.proxy(self)
 
@@ -592,7 +600,6 @@ class BaseCPUCodegen(object):
     def __init__(self, module_name):
         initialize_llvm()
 
-        self._libraries = set()
         self._data_layout = None
         self._llvm_module = ll.parse_assembly(
             str(self._create_empty_module(module_name)))
@@ -609,6 +616,9 @@ class BaseCPUCodegen(object):
         self._customize_tm_options(tm_options)
         tm = target.create_target_machine(**tm_options)
         engine = ll.create_mcjit_compiler(llvm_module, tm)
+
+        if config.ENABLE_PROFILING:
+            engine.enable_jit_events()
 
         self._tm = tm
         self._engine = JitEngine(engine)
@@ -632,14 +642,6 @@ class BaseCPUCodegen(object):
         The LLVM "target data" object for this codegen instance.
         """
         return self._target_data
-
-    def add_linking_library(self, library):
-        """
-        Add a library for linking into all libraries created by this
-        codegen object, without losing the original library.
-        """
-        library._ensure_finalized()
-        self._libraries.add(library)
 
     def create_library(self, name):
         """
@@ -784,7 +786,15 @@ class JITCPUCodegen(BaseCPUCodegen):
         # As long as we don't want to ship the code to another machine,
         # we can specialize for this CPU.
         options['cpu'] = self._get_host_cpu_name()
-        options['reloc'] = 'default'
+        # LLVM 7 change: # https://reviews.llvm.org/D47211#inline-425406
+        # JIT needs static relocation on x86*
+        # native target is already initialized from base class __init__
+        arch = ll.Target.from_default_triple().name
+        if arch.startswith('x86'): # one of x86 or x86_64
+            reloc_model = 'static'
+        else:
+            reloc_model = 'default'
+        options['reloc'] = reloc_model
         options['codemodel'] = 'jitdefault'
 
         # Set feature attributes (such as ISA extensions)

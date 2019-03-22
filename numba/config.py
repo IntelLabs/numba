@@ -152,6 +152,10 @@ class _EnvReloader(object):
         # Enable debugging of front-end operation (up to and including IR generation)
         DEBUG_FRONTEND = _readenv("NUMBA_DEBUG_FRONTEND", int, 0)
 
+        # How many recently deserialized functions to retain regardless
+        # of external references
+        FUNCTION_CACHE_SIZE = _readenv("NUMBA_FUNCTION_CACHE_SIZE", int, 128)
+
         # Enable logging of cache operation
         DEBUG_CACHE = _readenv("NUMBA_DEBUG_CACHE", int, DEBUG)
 
@@ -193,6 +197,9 @@ class _EnvReloader(object):
 
         # print stats about parallel for-loops
         DEBUG_ARRAY_OPT_STATS = _readenv("NUMBA_DEBUG_ARRAY_OPT_STATS", int, 0)
+        
+        # prints user friendly information about parllel
+        PARALLEL_DIAGNOSTICS =  _readenv("NUMBA_PARALLEL_DIAGNOSTICS", int, 0)
 
         # print debug info of inline closure pass
         DEBUG_INLINE_CLOSURE = _readenv("NUMBA_DEBUG_INLINE_CLOSURE", int, 0)
@@ -257,6 +264,9 @@ class _EnvReloader(object):
         # Disable jit for debugging
         DISABLE_JIT = _readenv("NUMBA_DISABLE_JIT", int, 0)
 
+        # choose parallel backend to use
+        THREADING_LAYER = _readenv("NUMBA_THREADING_LAYER", str, 'default')
+
         # CUDA Configs
 
         # Force CUDA compute capability to a specific version
@@ -295,11 +305,22 @@ class _EnvReloader(object):
         NUMBA_NUM_THREADS = _readenv("NUMBA_NUM_THREADS", int,
                                      NUMBA_DEFAULT_NUM_THREADS)
 
+        # Profiling support
+
+        # Indicates if a profiler detected. Only VTune can be detected for now
+        RUNNING_UNDER_PROFILER = 'VS_PROFILER' in os.environ
+
+        # Enables jit events in LLVM in order to support profiling of dynamic code
+        ENABLE_PROFILING = _readenv("NUMBA_ENABLE_PROFILING", int, int(RUNNING_UNDER_PROFILER))
+
         # Debug Info
 
         # The default value for the `debug` flag
-        DEBUGINFO_DEFAULT = _readenv("NUMBA_DEBUGINFO", int, 0)
+        DEBUGINFO_DEFAULT = _readenv("NUMBA_DEBUGINFO", int, ENABLE_PROFILING)
         CUDA_DEBUGINFO_DEFAULT = _readenv("NUMBA_CUDA_DEBUGINFO", int, 0)
+
+        # gdb binary location
+        GDB_BINARY = _readenv("NUMBA_GDB_BINARY", str, '/usr/bin/gdb')
 
         # Inject the configuration values into the module globals
         for name, value in locals().copy().items():

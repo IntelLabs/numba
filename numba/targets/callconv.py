@@ -148,13 +148,6 @@ class BaseCallConv(object):
         arginfo = self._get_arg_packer(argtypes)
         return arginfo.from_arguments(builder, raw_args)
 
-    def _fix_argtypes(self, argtypes):
-        """
-        Fix argument types, removing any omitted arguments.
-        """
-        return tuple(ty for ty in argtypes
-                     if not isinstance(ty, types.Omitted))
-
     def _get_arg_packer(self, argtypes):
         """
         Get an argument packer for the given argument types.
@@ -186,15 +179,30 @@ class MinimalCallConv(BaseCallConv):
         builder.store(retval, retptr)
         self._return_errcode_raw(builder, RETCODE_OK)
 
-    def return_user_exc(self, builder, exc, exc_args=None):
+    def return_user_exc(self, builder, exc, exc_args=None, loc=None,
+                        func_name=None):
         if exc is not None and not issubclass(exc, BaseException):
             raise TypeError("exc should be None or exception class, got %r"
                             % (exc,))
         if exc_args is not None and not isinstance(exc_args, tuple):
             raise TypeError("exc_args should be None or tuple, got %r"
                             % (exc_args,))
+
+        # Build excinfo struct
+        if loc is not None:
+            fname = loc._raw_function_name()
+            if fname is None:
+                # could be exec(<string>) or REPL, try func_name
+                fname = func_name
+
+            locinfo = (fname, loc.filename, loc.line)
+            if None in locinfo:
+                locinfo = None
+        else:
+            locinfo = None
+
         call_helper = self._get_call_helper(builder)
-        exc_id = call_helper._add_exception(exc, exc_args)
+        exc_id = call_helper._add_exception(exc, exc_args, locinfo)
         self._return_errcode_raw(builder, _const_int(exc_id))
 
     def return_status_propagate(self, builder, status):
@@ -283,9 +291,19 @@ class _MinimalCallHelper(object):
     def __init__(self):
         self.exceptions = {}
 
-    def _add_exception(self, exc, exc_args):
+    def _add_exception(self, exc, exc_args, locinfo):
+        """
+        Parameters
+        ----------
+        exc :
+            exception type
+        exc_args : None or tuple
+            exception args
+        locinfo : tuple
+            location information
+        """
         exc_id = len(self.exceptions) + FIRST_USEREXC
-        self.exceptions[exc_id] = exc, exc_args
+        self.exceptions[exc_id] = exc, exc_args, locinfo
         return exc_id
 
     def get_exception(self, exc_id):
@@ -327,17 +345,34 @@ class CPUCallConv(BaseCallConv):
         builder.store(retval, retptr)
         self._return_errcode_raw(builder, RETCODE_OK)
 
-    def return_user_exc(self, builder, exc, exc_args=None):
+    def return_user_exc(self, builder, exc, exc_args=None, loc=None,
+                        func_name=None):
         if exc is not None and not issubclass(exc, BaseException):
             raise TypeError("exc should be None or exception class, got %r"
                             % (exc,))
         if exc_args is not None and not isinstance(exc_args, tuple):
             raise TypeError("exc_args should be None or tuple, got %r"
                             % (exc_args,))
+        # None is indicative of no args, set the exc_args to an empty tuple
+        # as PyObject_CallObject(exc, exc_args) requires the second argument to
+        # be a tuple (or nullptr, but doing this makes it consistent)
+        if exc_args is None:
+            exc_args = tuple()
+
         pyapi = self.context.get_python_api(builder)
         # Build excinfo struct
-        if exc_args is not None:
-            exc = (exc, exc_args)
+        if loc is not None:
+            fname = loc._raw_function_name()
+            if fname is None:
+                # could be exec(<string>) or REPL, try func_name
+                fname = func_name
+
+            locinfo = (fname, loc.filename, loc.line)
+            if None in locinfo:
+                locinfo = None
+        else:
+            locinfo = None
+        exc = (exc, exc_args, locinfo)
         struct_gv = pyapi.serialize_object(exc)
         excptr = self._get_excinfo_argument(builder.function)
         builder.store(struct_gv, excptr)
@@ -454,9 +489,10 @@ class ErrorModel(object):
     def __init__(self, call_conv):
         self.call_conv = call_conv
 
-    def fp_zero_division(self, builder, exc_args=None):
+    def fp_zero_division(self, builder, exc_args=None, loc=None):
         if self.raise_on_fp_zero_division:
-            self.call_conv.return_user_exc(builder, ZeroDivisionError, exc_args)
+            self.call_conv.return_user_exc(builder, ZeroDivisionError, exc_args,
+                                           loc)
             return True
         else:
             return False

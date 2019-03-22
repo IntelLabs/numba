@@ -20,6 +20,7 @@ import functools
 import copy
 import warnings
 import logging
+from itertools import product
 from ctypes import (c_int, byref, c_size_t, c_char, c_char_p, addressof,
                     c_void_p, c_float)
 import contextlib
@@ -92,16 +93,16 @@ def find_driver():
     if sys.platform == 'win32':
         dlloader = ctypes.WinDLL
         dldir = ['\\windows\\system32']
-        dlname = 'nvcuda.dll'
+        dlnames = ['nvcuda.dll']
     elif sys.platform == 'darwin':
         dlloader = ctypes.CDLL
         dldir = ['/usr/local/cuda/lib']
-        dlname = 'libcuda.dylib'
+        dlnames = ['libcuda.dylib']
     else:
         # Assume to be *nix like
         dlloader = ctypes.CDLL
         dldir = ['/usr/lib', '/usr/lib64']
-        dlname = 'libcuda.so'
+        dlnames = ['libcuda.so', 'libcuda.so.1']
 
     if envpath is not None:
         try:
@@ -117,7 +118,8 @@ def find_driver():
     else:
         # First search for the name in the default library path.
         # If that is not found, try the specific path.
-        candidates = [dlname] + [os.path.join(x, dlname) for x in dldir]
+        candidates = dlnames + [os.path.join(x, y)
+                                for x, y in product(dldir, dlnames)]
 
     # Load the driver; Collect driver error information
     path_not_exist = []
@@ -694,9 +696,8 @@ class Context(object):
 
         self._attempt_allocation(allocator)
 
-        _memory_finalizer = _make_mem_finalizer(driver.cuMemFree, bytesize)
-        mem = MemoryPointer(weakref.proxy(self), ptr, bytesize,
-                            _memory_finalizer(self, ptr))
+        finalizer = _alloc_finalizer(self, ptr, bytesize)
+        mem = AutoFreePointer(weakref.proxy(self), ptr, bytesize, finalizer)
         self.allocations[ptr.value] = mem
         return mem.own()
 
@@ -720,17 +721,14 @@ class Context(object):
 
         owner = None
 
-        if mapped:
-            _hostalloc_finalizer = _make_mem_finalizer(driver.cuMemFreeHost,
-                                                       bytesize)
-            finalizer = _hostalloc_finalizer(self, pointer)
-            mem = MappedMemory(weakref.proxy(self), owner, pointer,
-                               bytesize, finalizer=finalizer)
+        finalizer = _hostalloc_finalizer(self, pointer, bytesize, mapped)
 
+        if mapped:
+            mem = MappedMemory(weakref.proxy(self), owner, pointer, bytesize,
+                               finalizer=finalizer)
             self.allocations[mem.handle.value] = mem
             return mem.own()
         else:
-            finalizer = _pinnedalloc_finalizer(self.deallocations, pointer)
             mem = PinnedMemory(weakref.proxy(self), owner, pointer, bytesize,
                                finalizer=finalizer)
             return mem
@@ -758,18 +756,16 @@ class Context(object):
         else:
             allocator()
 
+        finalizer = _pin_finalizer(self, pointer, mapped)
+
         if mapped:
-            _mapped_finalizer = _make_mem_finalizer(driver.cuMemHostUnregister,
-                                                    size)
-            finalizer = _mapped_finalizer(self, pointer)
             mem = MappedMemory(weakref.proxy(self), owner, pointer, size,
                                finalizer=finalizer)
             self.allocations[mem.handle.value] = mem
             return mem.own()
         else:
             mem = PinnedMemory(weakref.proxy(self), owner, pointer, size,
-                               finalizer=_pinned_finalizer(self.deallocations,
-                                                           pointer))
+                               finalizer=finalizer)
             return mem
 
     def memunpin(self, pointer):
@@ -783,15 +779,13 @@ class Context(object):
             raise OSError('OS does not support CUDA IPC')
         ipchandle = drvapi.cu_ipc_mem_handle()
         driver.cuIpcGetMemHandle(
-            ctypes.cast(
-                ipchandle,
-                ctypes.POINTER(drvapi.cu_ipc_mem_handle),
-                ),
-            memory.handle,
+            ctypes.byref(ipchandle),
+            memory.owner.handle,
             )
-
         source_info = self.device.get_device_identity()
-        return IpcHandle(memory, ipchandle, memory.size, source_info)
+        offset = memory.handle.value - memory.owner.handle.value
+        return IpcHandle(memory, ipchandle, memory.size, source_info,
+                         offset=offset)
 
     def open_ipc_handle(self, handle, size):
         # open the IPC handle to get the device pointer
@@ -869,7 +863,7 @@ def load_module_image(context, image):
     """
     image must be a pointer
     """
-    logsz = os.environ.get('NUMBAPRO_CUDA_LOG_SIZE', 1024)
+    logsz = int(os.environ.get('NUMBAPRO_CUDA_LOG_SIZE', 1024))
 
     jitinfo = (c_char * logsz)()
     jiterrors = (c_char * logsz)()
@@ -899,32 +893,60 @@ def load_module_image(context, image):
                   _module_finalizer(context, handle))
 
 
-def _make_mem_finalizer(dtor, bytesize):
-    def mem_finalize(context, handle):
-        allocations = context.allocations
-        deallocations = context.deallocations
+def _alloc_finalizer(context, handle, size):
+    allocations = context.allocations
+    deallocations = context.deallocations
 
-        def core():
-            if allocations:
-                del allocations[handle.value]
-
-            deallocations.add_item(dtor, handle, size=bytesize)
-
-        return core
-
-    return mem_finalize
-
-
-def _pinnedalloc_finalizer(deallocs, handle):
     def core():
-        deallocs.add_item(driver.cuMemFreeHost, handle)
+        if allocations:
+            del allocations[handle.value]
+        deallocations.add_item(driver.cuMemFree, handle, size)
 
     return core
 
 
-def _pinned_finalizer(deallocs, handle):
+def _hostalloc_finalizer(context, handle, size, mapped):
+    """
+    Finalize page-locked host memory allocated by `context.memhostalloc`.
+
+    This memory is managed by CUDA, and finalization entails deallocation. The
+    issues noted in `_pin_finalizer` are not relevant in this case, and the
+    finalization is placed in the `context.deallocations` queue along with
+    finalization of device objects.
+
+    """
+    allocations = context.allocations
+    deallocations = context.deallocations
+    if not mapped:
+        size = _SizeNotSet
+
     def core():
-        deallocs.add_item(driver.cuMemHostUnregister, handle)
+        if mapped and allocations:
+            del allocations[handle.value]
+        deallocations.add_item(driver.cuMemFreeHost, handle, size)
+
+    return core
+
+
+def _pin_finalizer(context, handle, mapped):
+    """
+    Finalize temporary page-locking of host memory by `context.mempin`.
+
+    This applies to memory not otherwise managed by CUDA. Page-locking can
+    be requested multiple times on the same memory, and must therefore be
+    lifted as soon as finalization is requested, otherwise subsequent calls to
+    `mempin` may fail with `CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED`, leading
+    to unexpected behavior for the context managers `cuda.{pinned,mapped}`.
+    This function therefore carries out finalization immediately, bypassing the
+    `context.deallocations` queue.
+
+    """
+    allocations = context.allocations
+
+    def core():
+        if mapped and allocations:
+            del allocations[handle.value]
+        driver.cuMemHostUnregister(handle)
 
     return core
 
@@ -970,6 +992,7 @@ class _CudaIpcImpl(object):
         self.base = parent.base
         self.handle = parent.handle
         self.size = parent.size
+        self.offset = parent.offset
         # remember if the handle is already opened
         self._opened_mem = None
 
@@ -983,12 +1006,12 @@ class _CudaIpcImpl(object):
         if self._opened_mem is not None:
             raise ValueError('IpcHandle is already opened')
 
-        mem = context.open_ipc_handle(self.handle, self.size)
+        mem = context.open_ipc_handle(self.handle, self.offset + self.size)
         # this object owns the opened allocation
         # note: it is required the memory be freed after the ipc handle is
         #       closed by the importing context.
         self._opened_mem = mem
-        return mem.own()
+        return mem.own().view(self.offset)
 
     def close(self):
         if self._opened_mem is None:
@@ -1045,12 +1068,13 @@ class IpcHandle(object):
     alive.  The *handle* is a ctypes object of the CUDA IPC handle. The *size*
     is the allocation size.
     """
-    def __init__(self, base, handle, size, source_info=None):
+    def __init__(self, base, handle, size, source_info=None, offset=0):
         self.base = base
         self.handle = handle
         self.size = size
         self.source_info = source_info
         self._impl = None
+        self.offset = offset
 
     def _sentry_source_info(self):
         if self.source_info is None:
@@ -1130,17 +1154,27 @@ class IpcHandle(object):
             preprocessed_handle,
             self.size,
             self.source_info,
+            self.offset,
             )
         return (serialize._rebuild_reduction, args)
 
     @classmethod
-    def _rebuild(cls, handle_ary, size, source_info):
+    def _rebuild(cls, handle_ary, size, source_info, offset):
         handle = drvapi.cu_ipc_mem_handle(*handle_ary)
         return cls(base=None, handle=handle, size=size,
-                   source_info=source_info)
+                   source_info=source_info, offset=offset)
 
 
 class MemoryPointer(object):
+    """A memory pointer that owns the buffer with an optional finalizer.
+
+    When an instance is deleted, the finalizer will be called regardless
+    of the `.refct`.
+
+    An instance is created with `.refct=1`.  The buffer lifetime
+    is tied to the MemoryPointer instance's lifetime.  The finalizer is invoked
+    only if the MemoryPointer instance's lifetime ends.
+    """
     __cuda_memory__ = True
 
     def __init__(self, context, pointer, size, finalizer=None, owner=None):
@@ -1149,7 +1183,7 @@ class MemoryPointer(object):
         self.size = size
         self._cuda_memsize_ = size
         self.is_managed = finalizer is not None
-        self.refct = 0
+        self.refct = 1
         self.handle = self.device_pointer
         self._owner = owner
 
@@ -1199,14 +1233,33 @@ class MemoryPointer(object):
                 raise RuntimeError('size cannot be negative')
             pointer = drvapi.cu_device_ptr(base)
             view = MemoryPointer(self.context, pointer, size, owner=self.owner)
-        return OwnedPointer(weakref.proxy(self.owner), view)
+
+        if isinstance(self.owner, (MemoryPointer, OwnedPointer)):
+            # Owned by a numba-managed memory segment, take an owned reference
+            return OwnedPointer(weakref.proxy(self.owner), view)
+        else:
+            # Owned by external alloc, return view with same external owner
+            return view
 
     @property
     def device_ctypes_pointer(self):
         return self.device_pointer
 
 
-class MappedMemory(MemoryPointer):
+class AutoFreePointer(MemoryPointer):
+    """Modifies the ownership semantic of the MemoryPointer so that the
+    instance lifetime is directly tied to the number of references.
+
+    When `.refct` reaches zero, the finalizer is invoked.
+    """
+    def __init__(self, *args, **kwargs):
+        super(AutoFreePointer, self).__init__(*args, **kwargs)
+        # Releease the self reference to the buffer, so that the finalizer
+        # is invoked if all the derived pointers are gone.
+        self.refct -= 1
+
+
+class MappedMemory(AutoFreePointer):
     __cuda_memory__ = True
 
     def __init__(self, context, owner, hostpointer, size,
@@ -1515,7 +1568,7 @@ FILE_EXTENSION_MAP = {
 
 
 class Linker(object):
-    def __init__(self):
+    def __init__(self, max_registers=0):
         logsz = int(os.environ.get('NUMBAPRO_CUDA_LOG_SIZE', 1024))
         linkerinfo = (c_char * logsz)()
         linkererrors = (c_char * logsz)()
@@ -1527,6 +1580,8 @@ class Linker(object):
             enums.CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES: c_void_p(logsz),
             enums.CU_JIT_LOG_VERBOSE: c_void_p(1),
         }
+        if max_registers:
+            options[enums.CU_JIT_MAX_REGISTERS] = c_void_p(max_registers)
 
         raw_keys = list(options.keys()) + [enums.CU_JIT_TARGET_FROM_CUCONTEXT]
         raw_values = list(options.values())
@@ -1660,12 +1715,30 @@ def device_memory_size(devmem):
         s, e = device_extents(devmem)
         sz = e - s
         devmem._cuda_memsize_ = sz
-    assert sz > 0, "zero length array"
+    assert sz >= 0, "{} length array".format(sz)
     return sz
 
 
-def host_pointer(obj):
+def _is_datetime_dtype(obj):
+    """Returns True if the obj.dtype is datetime64 or timedelta64
     """
+    dtype = getattr(obj, 'dtype', None)
+    return dtype is not None and dtype.char in 'Mm'
+
+
+def _workaround_for_datetime(obj):
+    """Workaround for numpy#4983: buffer protocol doesn't support
+    datetime64 or timedelta64.
+    """
+    if _is_datetime_dtype(obj):
+        obj = obj.view(np.int64)
+    return obj
+
+def host_pointer(obj, readonly=False):
+    """Get host pointer from an obj.
+
+    If `readonly` is False, the buffer must be writable.
+
     NOTE: The underlying data pointer from the host data buffer is used and
     it should not be changed until the operation which can be asynchronous
     completes.
@@ -1673,12 +1746,16 @@ def host_pointer(obj):
     if isinstance(obj, (int, long)):
         return obj
 
-    forcewritable = isinstance(obj, np.void)
-    return mviewbuf.memoryview_get_buffer(obj, forcewritable)
+    forcewritable = False
+    if not readonly:
+        forcewritable = isinstance(obj, np.void) or _is_datetime_dtype(obj)
 
+    obj = _workaround_for_datetime(obj)
+    return mviewbuf.memoryview_get_buffer(obj, forcewritable, readonly)
 
 def host_memory_extents(obj):
     "Returns (start, end) the start and end pointer of the array (half open)."
+    obj = _workaround_for_datetime(obj)
     return mviewbuf.memoryview_get_extents(obj)
 
 
@@ -1755,7 +1832,7 @@ def host_to_device(dst, src, size, stream=0):
     else:
         fn = driver.cuMemcpyHtoD
 
-    fn(device_pointer(dst), host_pointer(src), size, *varargs)
+    fn(device_pointer(dst), host_pointer(src, readonly=True), size, *varargs)
 
 
 def device_to_host(dst, src, size, stream=0):

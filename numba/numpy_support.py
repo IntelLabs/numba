@@ -87,20 +87,25 @@ def from_dtype(dtype):
     Return a Numba Type instance corresponding to the given Numpy *dtype*.
     NotImplementedError is raised on unsupported Numpy dtypes.
     """
-    if dtype.fields is None:
-        try:
-            return FROM_DTYPE[dtype]
-        except KeyError:
-            if dtype.char in 'SU':
-                return _from_str_dtype(dtype)
-            if dtype.char in 'mM':
-                return _from_datetime_dtype(dtype)
-            if dtype.char in 'V':
-                subtype = from_dtype(dtype.subdtype[0])
-                return types.NestedArray(subtype, dtype.shape)
-            raise NotImplementedError(dtype)
-    else:
+    if type(dtype) == type and issubclass(dtype, np.generic):
+        dtype = np.dtype(dtype)
+    elif getattr(dtype, "fields", None) is not None:
         return from_struct_dtype(dtype)
+
+    try:
+        return FROM_DTYPE[dtype]
+    except KeyError:
+        char = dtype.char
+
+        if char in 'SU':
+            return _from_str_dtype(dtype)
+        if char in 'mM':
+            return _from_datetime_dtype(dtype)
+        if char in 'V':
+            subtype = from_dtype(dtype.subdtype[0])
+            return types.NestedArray(subtype, dtype.shape)
+
+    raise NotImplementedError(dtype)
 
 
 _as_dtype_letters = {
@@ -110,11 +115,13 @@ _as_dtype_letters = {
     types.UnicodeCharSeq: 'U',
 }
 
+
 def as_dtype(nbtype):
     """
     Return a numpy dtype instance corresponding to the given Numba type.
     NotImplementedError is if no correspondence is known.
     """
+    nbtype = types.unliteral(nbtype)
     if isinstance(nbtype, (types.Complex, types.Integer, types.Float)):
         return np.dtype(str(nbtype))
     if nbtype is types.bool_:
@@ -129,12 +136,31 @@ def as_dtype(nbtype):
         letter = _as_dtype_letters[type(nbtype)]
         return np.dtype('%s%d' % (letter, nbtype.count))
     if isinstance(nbtype, types.Record):
-        return nbtype.dtype
+        return as_struct_dtype(nbtype)
     if isinstance(nbtype, types.EnumMember):
         return as_dtype(nbtype.dtype)
+    if isinstance(nbtype, types.npytypes.DType):
+        return as_dtype(nbtype.dtype)
+    if isinstance(nbtype, types.NumberClass):
+        return as_dtype(nbtype.dtype)
+    if isinstance(nbtype, types.NestedArray):
+        spec = (as_dtype(nbtype.dtype), tuple(nbtype.shape))
+        return np.dtype(spec)
     raise NotImplementedError("%r cannot be represented as a Numpy dtype"
                               % (nbtype,))
 
+def as_struct_dtype(rec):
+    """Convert Numba Record type to NumPy structured dtype
+    """
+    assert isinstance(rec, types.Record)
+    names = [k for k, _ in rec.members]
+    fields = {
+        'names': names,
+        'formats': [as_dtype(t) for _, t in rec.members],
+        'offsets': [rec.offset(k) for k in names],
+        'itemsize': rec.size,
+    }
+    return np.dtype(fields, align=rec.aligned)
 
 def is_arrayscalar(val):
     return np.dtype(type(val)) in FROM_DTYPE
@@ -385,15 +411,21 @@ def _is_aligned_struct(struct):
 
 
 def from_struct_dtype(dtype):
+    """Convert a NumPy structured dtype to Numba Record type
+    """
     if dtype.hasobject:
         raise TypeError("Do not support dtype containing object")
 
-    fields = {}
-
+    fields = []
     for name, info in dtype.fields.items():
         # *info* may have 3 element if it has a "title", which can be ignored
         [elemdtype, offset] = info[:2]
-        fields[name] = from_dtype(elemdtype), offset
+        ty = from_dtype(elemdtype)
+        infos = {
+            'type': ty,
+            'offset': offset,
+        }
+        fields.append((name, infos))
 
     # Note: dtype.alignment is not consistent.
     #       It is different after passing into a recarray.
@@ -401,7 +433,7 @@ def from_struct_dtype(dtype):
     size = dtype.itemsize
     aligned = _is_aligned_struct(dtype)
 
-    return types.Record(str(dtype.descr), fields, size, aligned, dtype)
+    return types.Record(fields, size, aligned)
 
 
 def _get_bytes_buffer(ptr, nbytes):

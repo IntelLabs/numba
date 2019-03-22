@@ -2,7 +2,7 @@ from __future__ import print_function, division, absolute_import
 
 from .abstract import *
 from .common import *
-from .misc import Undefined
+from .misc import Undefined, unliteral
 from ..typeconv import Conversion
 
 
@@ -102,6 +102,17 @@ class MemoryView(Buffer):
     """
 
 
+def is_homogeneous(*tys):
+    """Are the types homogeneous?
+    """
+    if tys:
+        first, tys = tys[0], tys[1:]
+        return not any(t != first for t in tys)
+    else:
+        # *tys* is empty.
+        return False
+
+
 class BaseTuple(ConstSized, Hashable):
     """
     The base class for all tuple types (with a known size).
@@ -112,27 +123,23 @@ class BaseTuple(ConstSized, Hashable):
         """
         Instantiate the right tuple type for the given element types.
         """
-        homogeneous = False
-        if tys:
-            first = tys[0]
-            for ty in tys[1:]:
-                if ty != first:
-                    break
-            else:
-                homogeneous = True
-
         if pyclass is not None and pyclass is not tuple:
             # A subclass => is it a namedtuple?
             assert issubclass(pyclass, tuple)
             if hasattr(pyclass, "_asdict"):
+                tys = tuple(map(unliteral, tys))
+                homogeneous = is_homogeneous(*tys)
                 if homogeneous:
-                    return NamedUniTuple(first, len(tys), pyclass)
+                    return NamedUniTuple(tys[0], len(tys), pyclass)
                 else:
                     return NamedTuple(tys, pyclass)
-        if homogeneous:
-            return UniTuple(first, len(tys))
         else:
-            return Tuple(tys)
+            # non-named tuple
+            homogeneous = is_homogeneous(*tys)
+            if homogeneous:
+                return UniTuple(tys[0], len(tys))
+            else:
+                return Tuple(tys)
 
 
 class BaseAnonymousTuple(BaseTuple):
@@ -156,6 +163,9 @@ class BaseAnonymousTuple(BaseTuple):
             if any(kind is None for kind in kinds):
                 return
             return max(kinds)
+
+    def __unliteral__(self):
+        return BaseTuple.from_types([unliteral(t) for t in self])
 
 
 class _HomogeneousTuple(Sequence, BaseTuple):
@@ -316,6 +326,7 @@ class List(MutableSequence):
     mutable = True
 
     def __init__(self, dtype, reflected=False):
+        dtype = unliteral(dtype)
         self.dtype = dtype
         self.reflected = reflected
         cls_name = "reflected list" if reflected else "list"
@@ -428,3 +439,69 @@ class SetEntry(Type):
     @property
     def key(self):
         return self.set_type
+
+
+class DictType(IterableType):
+    """Dictionary type
+    """
+    def __init__(self, keyty, valty):
+        assert not isinstance(keyty, TypeRef)
+        assert not isinstance(valty, TypeRef)
+        self.key_type = keyty
+        self.value_type = valty
+        self.keyvalue_type = Tuple([keyty, valty])
+        name = '{}[{},{}]'.format(
+            self.__class__.__name__,
+            keyty,
+            valty,
+        )
+        super(DictType, self).__init__(name)
+
+    @property
+    def iterator_type(self):
+        return DictKeysIterableType(self).iterator_type
+
+
+class DictItemsIterableType(SimpleIterableType):
+    """Dictionary iteratable type for .items()
+    """
+    def __init__(self, parent):
+        assert isinstance(parent, DictType)
+        self.parent = parent
+        self.yield_type = self.parent.keyvalue_type
+        name = "items[{}]".format(self.parent.name)
+        iterator_type = DictIteratorType(self)
+        super(DictItemsIterableType, self).__init__(name, iterator_type)
+
+
+class DictKeysIterableType(SimpleIterableType):
+    """Dictionary iteratable type for .items()
+    """
+    def __init__(self, parent):
+        assert isinstance(parent, DictType)
+        self.parent = parent
+        self.yield_type = self.parent.key_type
+        name = "keys[{}]".format(self.parent.name)
+        iterator_type = DictIteratorType(self)
+        super(DictKeysIterableType, self).__init__(name, iterator_type)
+
+
+class DictValuesIterableType(SimpleIterableType):
+    """Dictionary iteratable type for .items()
+    """
+    def __init__(self, parent):
+        assert isinstance(parent, DictType)
+        self.parent = parent
+        self.yield_type = self.parent.value_type
+        name = "values[{}]".format(self.parent.name)
+        iterator_type = DictIteratorType(self)
+        super(DictValuesIterableType, self).__init__(name, iterator_type)
+
+
+class DictIteratorType(SimpleIteratorType):
+    def __init__(self, iterable):
+        self.parent = iterable.parent
+        self.iterable = iterable
+        yield_type = iterable.yield_type
+        name = "iter[{}->{}]".format(iterable.parent, yield_type)
+        super(DictIteratorType, self).__init__(name, yield_type)

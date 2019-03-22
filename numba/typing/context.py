@@ -1,10 +1,11 @@
 from __future__ import print_function, absolute_import
 
-from collections import defaultdict, Sequence
+from collections import defaultdict
 import types as pytypes
 import weakref
 import threading
 import contextlib
+import operator
 
 import numba
 from numba import types, errors
@@ -13,6 +14,12 @@ from . import templates
 from .typeof import typeof, Purpose
 
 from numba import utils
+from numba.config import PYVERSION
+
+if PYVERSION >= (3, 3):
+    from collections.abc import Sequence
+else:
+    from collections import Sequence
 
 
 class Rating(object):
@@ -174,24 +181,55 @@ class BaseContext(object):
 
         return '\n'.join(desc)
 
-    def resolve_function_type(self, func, args, kws, literals=None):
+    def resolve_function_type(self, func, args, kws):
         """
         Resolve function type *func* for argument types *args* and *kws*.
         A signature is returned.
         """
-        if func not in self._functions:
-            # It's not a known function type, perhaps it's a global?
-            functy = self._lookup_global(func)
-            if functy is not None:
-                func = functy
+        # Prefer user definition first
+        try:
+            res = self._resolve_user_function_type(func, args, kws)
+        except errors.TypingError as e:
+            # Capture any typing error
+            last_exception = e
+            res = None
+        else:
+            last_exception = None
+
+        # Return early we there's a working user function
+        if res is not None:
+            return res
+
+        # Check builtin functions
+        res = self._resolve_builtin_function_type(func, args, kws)
+
+        # Re-raise last_exception if no function type has been found
+        if res is None and last_exception is not None:
+            raise last_exception
+
+        return res
+
+    def _resolve_builtin_function_type(self, func, args, kws):
+        # NOTE: we should reduce usage of this
         if func in self._functions:
             # Note: Duplicating code with types.Function.get_call_type().
             #       *defns* are CallTemplates.
             defns = self._functions[func]
             for defn in defns:
-                res = defn.apply(args, kws)
-                if res is not None:
-                    return res
+                for support_literals in [True, False]:
+                    if support_literals:
+                        res = defn.apply(args, kws)
+                    else:
+                        fixedargs = [types.unliteral(a) for a in args]
+                        res = defn.apply(fixedargs, kws)
+                    if res is not None:
+                        return res
+
+    def _resolve_user_function_type(self, func, args, kws, literals=None):
+        # It's not a known function type, perhaps it's a global?
+        functy = self._lookup_global(func)
+        if functy is not None:
+            func = functy
 
         if isinstance(func, types.Type):
             # If it's a type, it may support a __call__ method
@@ -202,7 +240,7 @@ class BaseContext(object):
 
         if isinstance(func, types.Callable):
             # XXX fold this into the __call__ attribute logic?
-            return func.get_call_type_with_literals(self, args, kws, literals)
+            return func.get_call_type(self, args, kws)
 
     def _get_attribute_templates(self, typ):
         """
@@ -222,10 +260,20 @@ class BaseContext(object):
         Resolve getting the attribute *attr* (a string) on the Numba type.
         The attribute's type is returned, or None if resolution failed.
         """
-        for attrinfo in self._get_attribute_templates(typ):
-            ret = attrinfo.resolve(typ, attr)
-            if ret is not None:
-                return ret
+        def core(typ):
+            for attrinfo in self._get_attribute_templates(typ):
+                ret = attrinfo.resolve(typ, attr)
+                if ret is not None:
+                    return ret
+
+        out = core(typ)
+        if out is not None:
+            return out
+
+        # Try again without literals
+        out = core(types.unliteral(typ))
+        if out is not None:
+            return out
 
         if isinstance(typ, types.Module):
             attrty = self.resolve_module_constants(typ, attr)
@@ -254,19 +302,23 @@ class BaseContext(object):
     def resolve_static_setitem(self, target, index, value):
         assert not isinstance(index, types.Type), index
         args = target, index, value
-        kws = ()
+        kws = {}
         return self.resolve_function_type("static_setitem", args, kws)
 
     def resolve_setitem(self, target, index, value):
         assert isinstance(index, types.Type), index
         args = target, index, value
-        kws = ()
-        return self.resolve_function_type("setitem", args, kws)
+        kws = {}
+        fnty = self.resolve_value_type(operator.setitem)
+        sig = fnty.get_call_type(self, (target, index, value), {})
+        return sig
 
     def resolve_delitem(self, target, index):
         args = target, index
-        kws = ()
-        return self.resolve_function_type("delitem", args, kws)
+        kws = {}
+        fnty = self.resolve_value_type(operator.delitem)
+        sig = fnty.get_call_type(self, args, kws)
+        return sig
 
     def resolve_module_constants(self, typ, attr):
         """
@@ -311,7 +363,7 @@ class BaseContext(object):
         else:
             return ty
 
-        if isinstance(val, (types.ExternalFunction, types.NumbaFunction)):
+        if isinstance(val, types.ExternalFunction):
             return val
 
         # Try to look up target specific typing information
@@ -453,7 +505,8 @@ class BaseContext(object):
             else:
                 return min(forward, backward)
 
-    def _rate_arguments(self, actualargs, formalargs, unsafe_casting=True):
+    def _rate_arguments(self, actualargs, formalargs, unsafe_casting=True,
+                        exact_match_required=False):
         """
         Rate the actual arguments for compatibility against the formal
         arguments.  A Rating instance is returned, or None if incompatible.
@@ -466,6 +519,8 @@ class BaseContext(object):
             if conv is None:
                 return None
             elif not unsafe_casting and conv >= Conversion.unsafe:
+                return None
+            elif exact_match_required and conv != Conversion.exact:
                 return None
 
             if conv == Conversion.promote:
@@ -501,7 +556,8 @@ class BaseContext(object):
         return True
 
     def resolve_overload(self, key, cases, args, kws,
-                         allow_ambiguous=True, unsafe_casting=True):
+                         allow_ambiguous=True, unsafe_casting=True,
+                         exact_match_required=False):
         """
         Given actual *args* and *kws*, find the best matching
         signature in *cases*, or None if none matches.
@@ -513,6 +569,7 @@ class BaseContext(object):
         assert not kws, "Keyword arguments are not supported, yet"
         options = {
             'unsafe_casting': unsafe_casting,
+            'exact_match_required': exact_match_required,
         }
         # Rate each case
         candidates = []
@@ -553,7 +610,6 @@ class BaseContext(object):
             Fallback to stable, deterministic sort.
             """
             return getattr(obj, 'bitwidth', 0)
-
         typelist = sorted(typelist, key=keyfunc)
         unified = typelist[0]
         for tp in typelist[1:]:
@@ -595,6 +651,11 @@ class BaseContext(object):
             # Can convert from second to first
             return first
 
+        if isinstance(first, types.Literal) or isinstance(second, types.Literal):
+            first = types.unliteral(first)
+            second = types.unliteral(second)
+            return self.unify_pairs(first, second)
+
         # Cannot unify
         return None
 
@@ -603,13 +664,12 @@ class Context(BaseContext):
 
     def load_additional_registries(self):
         from . import (cffi_utils, cmathdecl, enumdecl, listdecl, mathdecl,
-                       npydecl, operatordecl, randomdecl, setdecl)
+                       npydecl, randomdecl, setdecl)
         self.install_registry(cffi_utils.registry)
         self.install_registry(cmathdecl.registry)
         self.install_registry(enumdecl.registry)
         self.install_registry(listdecl.registry)
         self.install_registry(mathdecl.registry)
         self.install_registry(npydecl.registry)
-        self.install_registry(operatordecl.registry)
         self.install_registry(randomdecl.registry)
         self.install_registry(setdecl.registry)

@@ -36,11 +36,11 @@ def from_cuda_array_interface(desc, owner=None):
 
     shape, strides, dtype = _prepare_shape_strides_dtype(
         shape, strides, dtype, order='C')
+    size = driver.memory_size_from_info(shape, strides, dtype.itemsize)
 
     devptr = driver.get_devptr_for_active_ctx(desc['data'][0])
     data = driver.MemoryPointer(
-        current_context(), devptr, size=np.prod(shape) * dtype.itemsize,
-        owner=owner)
+        current_context(), devptr, size=size, owner=owner)
     da = devicearray.DeviceNDArray(shape=shape, strides=strides,
                                    dtype=dtype, gpu_data=data)
     return da
@@ -162,7 +162,7 @@ def mapped_array(shape, dtype=np.float, strides=None, order='C', stream=0,
 
 @contextlib.contextmanager
 @require_context
-def open_ipc_array(handle, shape, dtype, strides=None):
+def open_ipc_array(handle, shape, dtype, strides=None, offset=0):
     """
     A context manager that opens a IPC *handle* (*CUipcMemHandle*) that is
     represented as a sequence of bytes (e.g. *bytes*, tuple of int)
@@ -180,7 +180,7 @@ def open_ipc_array(handle, shape, dtype, strides=None):
     # manually recreate the IPC mem handle
     handle = driver.drvapi.cu_ipc_mem_handle(*handle)
     # use *IpcHandle* to open the IPC memory
-    ipchandle = driver.IpcHandle(None, handle, size)
+    ipchandle = driver.IpcHandle(None, handle, size, offset=offset)
     yield ipchandle.open_array(current_context(), shape=shape,
                                strides=strides, dtype=dtype)
     ipchandle.close()
@@ -248,7 +248,6 @@ def pinned(*arylist):
                                       mapped=False)
         pmlist.append(pm)
     yield
-    del pmlist
 
 
 @require_context
@@ -257,22 +256,27 @@ def mapped(*arylist, **kws):
     """A context manager for temporarily mapping a sequence of host ndarrays.
     """
     assert not kws or 'stream' in kws, "Only accept 'stream' as keyword."
-    pmlist = []
     stream = kws.get('stream', 0)
+    pmlist = []
+    devarylist = []
     for ary in arylist:
         pm = current_context().mempin(ary, driver.host_pointer(ary),
                                     driver.host_memory_size(ary),
                                     mapped=True)
         pmlist.append(pm)
-
-    devarylist = []
-    for ary, pm in zip(arylist, pmlist):
         devary = devicearray.from_array_like(ary, gpu_data=pm, stream=stream)
         devarylist.append(devary)
-    if len(devarylist) == 1:
-        yield devarylist[0]
-    else:
-        yield devarylist
+    try:
+        if len(devarylist) == 1:
+            yield devarylist[0]
+        else:
+            yield devarylist
+    finally:
+        # When exiting from `with cuda.mapped(*arrs) as mapped_arrs:`, the name
+        # `mapped_arrs` stays in scope, blocking automatic unmapping based on
+        # reference count. We therefore invoke the finalizer manually.
+        for pm in pmlist:
+            pm.free()
 
 
 def event(timing=True):

@@ -137,6 +137,8 @@ The following methods of Numpy arrays are supported in their basic form
 * :meth:`~numpy.ndarray.any`
 * :meth:`~numpy.ndarray.argmax`
 * :meth:`~numpy.ndarray.argmin`
+* :meth:`~numpy.ndarray.conj`
+* :meth:`~numpy.ndarray.conjugate`
 * :meth:`~numpy.ndarray.cumprod`
 * :meth:`~numpy.ndarray.cumsum`
 * :meth:`~numpy.ndarray.max`
@@ -156,7 +158,8 @@ Other methods
 
 The following methods of Numpy arrays are supported:
 
-* :meth:`~numpy.ndarray.argsort` (without arguments)
+* :meth:`~numpy.ndarray.argsort` (``kind`` key word argument supported for
+  values ``'quicksort'`` and ``'mergesort'``)
 * :meth:`~numpy.ndarray.astype` (only the 1-argument form)
 * :meth:`~numpy.ndarray.copy` (without arguments)
 * :meth:`~numpy.ndarray.dot` (only the 1-argument form)
@@ -230,16 +233,18 @@ The following reduction functions are supported:
 
 * :func:`numpy.diff` (only the 2 first arguments)
 * :func:`numpy.median` (only the first argument)
+* :func:`numpy.nancumprod` (only the first argument, requires NumPy >= 1.12))
+* :func:`numpy.nancumsum` (only the first argument, requires NumPy >= 1.12))
 * :func:`numpy.nanmax` (only the first argument)
 * :func:`numpy.nanmean` (only the first argument)
 * :func:`numpy.nanmedian` (only the first argument)
 * :func:`numpy.nanmin` (only the first argument)
+* :func:`numpy.nanpercentile` (only the 2 first arguments, requires NumPy >= 1.11)
 * :func:`numpy.nanprod` (only the first argument)
 * :func:`numpy.nanstd` (only the first argument)
 * :func:`numpy.nansum` (only the first argument)
 * :func:`numpy.nanvar` (only the first argument)
 * :func:`numpy.percentile` (only the 2 first arguments, requires NumPy >= 1.10)
-* :func:`numpy.nanpercentile` (only the 2 first arguments, requires NumPy >= 1.11)
 
 Other functions
 ---------------
@@ -247,8 +252,10 @@ Other functions
 The following top-level functions are supported:
 
 * :func:`numpy.arange`
-* :func:`numpy.argsort` (no optional arguments)
+* :func:`numpy.argsort` (``kind`` key word argument supported for values
+  ``'quicksort'`` and ``'mergesort'``)
 * :func:`numpy.array` (only the 2 first arguments)
+* :func:`numpy.asarray` (only the 2 first arguments)
 * :func:`numpy.asfortranarray` (only the first argument)
 * :func:`numpy.atleast_1d`
 * :func:`numpy.atleast_2d`
@@ -258,14 +265,21 @@ The following top-level functions are supported:
 * :func:`numpy.concatenate`
 * :func:`numpy.convolve` (only the 2 first arguments)
 * :func:`numpy.copy` (only the first argument)
+* :func:`numpy.corrcoef` (only the 3 first arguments, requires NumPy >= 1.10 and
+  SciPy >= 0.16; extreme value handling per NumPy 1.11+)
 * :func:`numpy.correlate` (only the 2 first arguments)
+* :func:`numpy.cov` (only the 5 first arguments, requires NumPy >= 1.10 and SciPy >= 0.16)
 * :func:`numpy.diag`
 * :func:`numpy.digitize`
 * :func:`numpy.dstack`
+* :func:`numpy.dtype` (only the first argument)
+* :func:`numpy.ediff1d`
 * :func:`numpy.empty` (only the 2 first arguments)
 * :func:`numpy.empty_like` (only the 2 first arguments)
 * :func:`numpy.expand_dims`
+* :func:`numpy.extract`
 * :func:`numpy.eye`
+* :func:`numpy.fill_diagonal`
 * :func:`numpy.flatten` (no order argument; 'C' order only)
 * :func:`numpy.frombuffer` (only the 2 first arguments)
 * :func:`numpy.full` (only the 3 first arguments)
@@ -273,14 +287,21 @@ The following top-level functions are supported:
 * :func:`numpy.histogram` (only the 3 first arguments)
 * :func:`numpy.hstack`
 * :func:`numpy.identity`
+* :func:`numpy.interp` (only the 3 first arguments; requires NumPy >= 1.10;
+  complex dtype handling per NumPy 1.12+; ``xp`` must be monotonically
+  increasing)
 * :func:`numpy.linspace` (only the 3-argument form)
 * :class:`numpy.ndenumerate`
 * :class:`numpy.ndindex`
 * :class:`numpy.nditer` (only the first argument)
 * :func:`numpy.ones` (only the 2 first arguments)
 * :func:`numpy.ones_like` (only the 2 first arguments)
+* :func:`numpy.partition` (only the 2 first arguments)
+* :func:`numpy.ptp` (only the first argument)
 * :func:`numpy.ravel` (no order argument; 'C' order only)
 * :func:`numpy.reshape` (no order argument; 'C' order only)
+* :func:`numpy.roll` (only the 2 first arguments; second argument ``shift``
+  must be an integer)
 * :func:`numpy.roots`
 * :func:`numpy.round_`
 * :func:`numpy.searchsorted` (only the 3 first arguments)
@@ -289,7 +310,12 @@ The following top-level functions are supported:
 * :func:`numpy.stack`
 * :func:`numpy.take` (only the 2 first arguments)
 * :func:`numpy.transpose`
+* :func:`numpy.trapz` (only the 3 first arguments)
+* :func:`numpy.tri` (only the 3 first arguments; third argument ``k`` must be an integer)
+* :func:`numpy.tril` (second argument ``k`` must be an integer)
+* :func:`numpy.triu` (second argument ``k`` must be an integer)
 * :func:`numpy.unique` (only the first argument)
+* :func:`numpy.vander`
 * :func:`numpy.vstack`
 * :func:`numpy.where`
 * :func:`numpy.zeros` (only the 2 first arguments)
@@ -424,13 +450,8 @@ Distributions
    Numba random generator.
 
 .. note::
-   The generator is not thread-safe when :ref:`releasing the GIL <jit-nogil>`.
-
-   Also, under Unix, if creating a child process using :func:`os.fork` or the
-   :mod:`multiprocessing` module, the child's random generator will inherit
-   the parent's state and will therefore produce the same sequence of
-   numbers (except when using the "forkserver" start method under Python 3.4
-   and later).
+   Since version 0.28.0, the generator is thread-safe and fork-safe.  Each
+   thread and each process will produce independent streams of random numbers.
 
 
 ``stride_tricks``

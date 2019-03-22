@@ -6,12 +6,15 @@ import os
 import sys
 
 from llvmlite import ir
+from llvmlite.binding import Linkage
 import llvmlite.llvmpy.core as lc
 
 from numba import cgutils
 from numba.utils import IS_PY3
 from . import llvm_types as lt
 from numba.compiler import compile_extra, Flags
+from numba.compiler_lock import global_compiler_lock
+
 from numba.targets.registry import cpu_target
 from numba.runtime import nrtdynmod
 
@@ -124,6 +127,7 @@ class _ModuleCompiler(object):
         """
         raise NotImplementedError
 
+    @global_compiler_lock
     def _cull_exports(self):
         """Read all the exported functions/modules in the translator
         environment, and join them into a single LLVM module.
@@ -148,10 +152,10 @@ class _ModuleCompiler(object):
 
         for entry in self.export_entries:
             cres = compile_extra(self.typing_context, self.context,
-                                 entry.function,
-                                 entry.signature.args,
-                                 entry.signature.return_type, flags,
-                                 locals={}, library=library)
+                                entry.function,
+                                entry.signature.args,
+                                entry.signature.return_type, flags,
+                                locals={}, library=library)
 
             func_name = cres.fndesc.llvm_func_name
             llvm_func = cres.library.get_function(func_name)
@@ -180,8 +184,11 @@ class _ModuleCompiler(object):
         library.finalize()
         for fn in library.get_defined_functions():
             if fn.name not in self.dll_exports:
-                fn.visibility = "hidden"
-
+                if fn.linkage in {Linkage.private, Linkage.internal}:
+                    # Private/Internal linkage must have "default" visibility
+                    fn.visibility = "default"
+                else:
+                    fn.visibility = 'hidden'
         return library
 
     def write_llvm_bitcode(self, output, wrap=False, **kws):

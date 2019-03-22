@@ -4,7 +4,9 @@ Provide math calls that uses intrinsics or libc math functions.
 
 from __future__ import print_function, absolute_import, division
 import math
+import operator
 import sys
+import numpy as np
 
 import llvmlite.llvmpy.core as lc
 from llvmlite.llvmpy.core import Type
@@ -19,9 +21,13 @@ lower = registry.lower
 
 
 # Helpers, shared with cmathimpl.
+_NP_FLT_FINFO = np.finfo(np.dtype('float32'))
+FLT_MAX = _NP_FLT_FINFO.max
+FLT_MIN = _NP_FLT_FINFO.tiny
 
-FLT_MAX = 3.402823466E+38
-FLT_MIN = 1.175494351E-38
+_NP_DBL_FINFO = np.finfo(np.dtype('float64'))
+DBL_MAX = _NP_DBL_FINFO.max
+DBL_MIN = _NP_DBL_FINFO.tiny
 
 FLOAT_ABS_MASK = 0x7fffffff
 FLOAT_SIGN_MASK = 0x80000000
@@ -401,5 +407,5 @@ unary_math_int_impl(math.degrees, degrees_float_impl)
 @lower(math.pow, types.Float, types.Float)
 @lower(math.pow, types.Float, types.Integer)
 def pow_impl(context, builder, sig, args):
-    impl = context.get_function("**", sig)
+    impl = context.get_function(operator.pow, sig)
     return impl(builder, args)

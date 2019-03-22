@@ -6,6 +6,7 @@ import sys
 
 from .abstract import *
 from .common import *
+from .misc import unliteral
 from numba.ir import Loc
 from numba import errors
 
@@ -41,18 +42,21 @@ class _ResolutionFailures(object):
         indent = ' ' * 4
         args = [str(a) for a in self._args]
         args += ["%s=%s" % (k, v) for k, v in sorted(self._kwargs.items())]
-        headtmp = 'Invalid usage of {} with parameters ({})'
+        headtmp = 'Invalid use of {} with argument(s) of type(s): ({})'
         msgbuf = [headtmp.format(self._function_type, ', '.join(args))]
         explain = self._context.explain_function_type(self._function_type)
         msgbuf.append(explain)
         for i, (temp, error) in enumerate(self._failures):
-            msgbuf.append("In definition {}:".format(i))
+            msgbuf.append(_termcolor.errmsg("In definition {}:".format(i)))
             msgbuf.append(_termcolor.highlight('{}{}'.format(
                 indent, self.format_error(error))))
             loc = self.get_loc(temp, error)
             if loc:
                 msgbuf.append('{}raised from {}'.format(indent, loc))
 
+        likely_cause = ("This error is usually caused by passing an argument "
+                        "of a type that is unsupported by the named function.")
+        msgbuf.append(_termcolor.errmsg(likely_cause))
         return '\n'.join(msgbuf)
 
     def format_error(self, error):
@@ -112,27 +116,28 @@ class BaseFunction(Callable):
         return self._impl_keys[sig.args]
 
     def get_call_type(self, context, args, kws):
-        return self.get_call_type_with_literals(context, args, kws,
-                                                literals=None)
-
-    def get_call_type_with_literals(self, context, args, kws, literals):
         failures = _ResolutionFailures(context, self, args, kws)
         for temp_cls in self.templates:
             temp = temp_cls(context)
-            try:
-                if literals is not None and temp.support_literals:
-                    sig = temp.apply(*literals)
+            for uselit in [True, False]:
+                try:
+                    if uselit:
+                        sig = temp.apply(args, kws)
+                    else:
+                        nolitargs = tuple([unliteral(a) for a in args])
+                        nolitkws = {k: unliteral(v) for k, v in kws.items()}
+                        sig = temp.apply(nolitargs, nolitkws)
+                except Exception as e:
+                    sig = None
+                    failures.add_error(temp_cls, e)
                 else:
-                    sig = temp.apply(args, kws)
-            except Exception as e:
-                sig = None
-                failures.add_error(temp_cls, e)
-            else:
-                if sig is not None:
-                    self._impl_keys[sig.args] = temp.get_impl_key(sig)
-                    return sig
-                else:
-                    failures.add_error(temp_cls, "All templates rejected")
+                    if sig is not None:
+                        self._impl_keys[sig.args] = temp.get_impl_key(sig)
+                        return sig
+                    else:
+                        haslit= '' if uselit else 'out'
+                        msg = "All templates rejected with%s literals." % haslit
+                        failures.add_error(temp_cls, msg)
 
         if len(failures) == 0:
             raise AssertionError("Internal Error. "
@@ -195,18 +200,29 @@ class BoundFunction(Callable, Opaque):
         return self.typing_key
 
     def get_call_type(self, context, args, kws):
-        return self.template(context).apply(args, kws)
-
-    def get_call_type_with_literals(self, context, args, kws, literals):
-        if literals is not None and self.template.support_literals:
-            return self.template(context).apply(*literals)
-        else:
-            return self.get_call_type(context, args, kws)
+        template = self.template(context)
+        e = None
+        # Try with Literal
+        try:
+            out = template.apply(args, kws)
+        except Exception as e:
+            out = None
+        # If that doesn't work, remove literals
+        if out is None:
+            args = [unliteral(a) for a in args]
+            kws = {k: unliteral(v) for k, v in kws.items()}
+            out = template.apply(args, kws)
+        if out is None and e is not None:
+            raise e
+        return out
 
     def get_call_signatures(self):
         sigs = getattr(self.template, 'cases', [])
         is_param = hasattr(self.template, 'generic')
         return sigs, is_param
+
+class MakeFunctionLiteral(Literal, Opaque):
+    pass
 
 
 class WeakType(Type):
@@ -282,6 +298,12 @@ class Dispatcher(WeakType, Callable, Dummy):
         return self.get_overload(sig)
 
 
+class ObjModeDispatcher(Dispatcher):
+    """Dispatcher subclass that enters objectmode function.
+    """
+    pass
+
+
 class ExternalFunctionPointer(BaseFunction):
     """
     A pointer to a native function (e.g. exported via ctypes or cffi).
@@ -338,26 +360,6 @@ class ExternalFunction(Function):
     @property
     def key(self):
         return self.symbol, self.sig
-
-
-class NumbaFunction(Function):
-    """
-    A named native function with the Numba calling convention
-    (resolvable by LLVM).
-    For internal use only.
-    """
-
-    def __init__(self, fndesc, sig):
-        from .. import typing
-        self.fndesc = fndesc
-        self.sig = sig
-        template = typing.make_concrete_template(fndesc.qualname,
-                                                 fndesc.qualname, [sig])
-        super(NumbaFunction, self).__init__(template)
-
-    @property
-    def key(self):
-        return self.fndesc.unique_name, self.sig
 
 
 class NamedTupleClass(Callable, Opaque):

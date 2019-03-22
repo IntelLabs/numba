@@ -14,6 +14,7 @@ Constraints push types forward following the dataflow.
 
 from __future__ import print_function, division, absolute_import
 
+import operator
 import contextlib
 import itertools
 from pprint import pprint
@@ -103,11 +104,9 @@ class TypeVar(object):
     def get(self):
         return (self.type,) if self.type is not None else ()
 
-    def getone(self, get_literals=False):
+    def getone(self):
         if self.type is None:
             raise TypingError("Undecided type {}".format(self))
-        if self.literal_value is not NOTSET and get_literals:
-            return types.Const(self.literal_value)
         return self.type
 
     def __len__(self):
@@ -326,7 +325,7 @@ class StaticGetItemConstraint(object):
         self.value = value
         self.index = index
         if index_var is not None:
-            self.fallback = IntrinsicCallConstraint(target, 'getitem',
+            self.fallback = IntrinsicCallConstraint(target, operator.getitem,
                                                     (value, index_var), {},
                                                     None, loc)
         else:
@@ -337,9 +336,12 @@ class StaticGetItemConstraint(object):
         with new_error_context("typing of static-get-item at {0}", self.loc):
             typevars = typeinfer.typevars
             for ty in typevars[self.value.name].get():
-                itemty = typeinfer.context.resolve_static_getitem(
-                            value=ty, index=self.index)
-                if itemty is not None:
+                sig = typeinfer.context.resolve_static_getitem(
+                    value=ty, index=self.index,
+                )
+
+                if sig is not None:
+                    itemty = sig.return_type
                     assert itemty.is_precise()
                     typeinfer.add_type(self.target, itemty, loc=self.loc)
                 elif self.fallback is not None:
@@ -350,7 +352,7 @@ class StaticGetItemConstraint(object):
         return self.fallback and self.fallback.get_call_signature()
 
 
-def fold_arg_vars(typevars, args, vararg, kws, get_literals=False):
+def fold_arg_vars(typevars, args, vararg, kws):
     """
     Fold and resolve the argument variables of a function call.
     """
@@ -365,19 +367,19 @@ def fold_arg_vars(typevars, args, vararg, kws, get_literals=False):
     if not all(a.defined for a in argtypes):
         return
 
-    args = tuple(a.getone(get_literals=get_literals) for a in argtypes)
+    args = tuple(a.getone() for a in argtypes)
 
     pos_args = args[:n_pos_args]
     if vararg is not None:
         errmsg = "*args in function call should be a tuple, got %s"
         # Handle constant literal used for `*args`
-        if isinstance(args[-1], types.Const):
-            const_val = args[-1].value
+        if isinstance(args[-1], types.Literal):
+            const_val = args[-1].literal_value
             # Is the constant value a tuple?
             if not isinstance(const_val, tuple):
                 raise TypeError(errmsg % (args[-1],))
             # Append the elements in the const tuple to the positional args
-            pos_args += args[-1].value
+            pos_args += const_val
         # Handle non-constant
         elif not isinstance(args[-1], types.BaseTuple):
             # Unsuitable for *args
@@ -434,25 +436,18 @@ class CallConstraint(object):
 
         # Check argument to be precise
         for a in itertools.chain(pos_args, kw_args.values()):
-            if not a.is_precise():
-                # Getitem on non-precise array is allowed to
-                # support array-comprehension
-                if fnty == 'getitem' and isinstance(pos_args[0], types.Array):
-                    pass
-                # Otherwise, don't compute type yet
-                else:
-                    return
+            # Forbids imprecise type except array of undefined dtype
+            if not a.is_precise() and not isinstance(a, types.Array):
+                return
 
-        literals = fold_arg_vars(typevars, self.args, self.vararg, self.kws,
-                                 get_literals=True)
         # Resolve call type
-        sig = typeinfer.resolve_call(fnty, pos_args, kw_args,
-                                     literals=literals)
+        sig = typeinfer.resolve_call(fnty, pos_args, kw_args)
+
         if sig is None:
             # Note: duplicated error checking.
             #       See types.BaseFunction.get_call_type
             # Arguments are invalid => explain why
-            headtemp = "Invalid usage of {0} with parameters ({1})"
+            headtemp = "Invalid use of {0} with parameters ({1})"
             args = [str(a) for a in pos_args]
             args += ["%s=%s" % (k, v) for k, v in sorted(kw_args.items())]
             head = headtemp.format(fnty, ', '.join(map(str, args)))
@@ -494,7 +489,7 @@ class CallConstraint(object):
 
     def refine(self, typeinfer, updated_type):
         # Is getitem?
-        if self.func == 'getitem':
+        if self.func == operator.getitem:
             aryty = typeinfer.typevars[self.args[0].name].getone()
             # is array not precise?
             if _is_array_not_precise(aryty):
@@ -510,7 +505,10 @@ class CallConstraint(object):
 class IntrinsicCallConstraint(CallConstraint):
     def __call__(self, typeinfer):
         with new_error_context("typing of intrinsic-call at {0}", self.loc):
-            self.resolve(typeinfer, typeinfer.typevars, fnty=self.func)
+            fnty = self.func
+            if fnty in utils.OPERATORS_TO_BUILTINS:
+                fnty = typeinfer.resolve_value_type(None, fnty)
+            self.resolve(typeinfer, typeinfer.typevars, fnty=fnty)
 
 
 class GetAttrConstraint(object):
@@ -835,7 +833,7 @@ class TypeInferer(object):
             if retvar.name in cloned.typevars:
                 typevar = cloned.typevars[retvar.name]
                 if typevar and typevar.defined:
-                    rettypes.add(typevar.getone())
+                    rettypes.add(types.unliteral(typevar.getone()))
         if not rettypes:
             return
         # unify return types
@@ -872,6 +870,7 @@ class TypeInferer(object):
             self.propagate_refined_type(var, unified)
 
     def add_calltype(self, inst, signature):
+        assert signature is not None
         self.calltypes[inst] = signature
 
     def copy_type(self, src_var, dest_var, loc):
@@ -893,23 +892,82 @@ class TypeInferer(object):
         """
         typdict = utils.UniqueDict()
 
+        def find_offender(name, exhaustive=False):
+            # finds the offending variable definition by name
+            # if exhaustive is set it will try and trace through temporary
+            # variables to find a concrete offending definition.
+            offender = None
+            for block in self.func_ir.blocks.values():
+                offender = block.find_variable_assignment(name)
+                if offender is not None:
+                    if not exhaustive:
+                        break
+                    try: # simple assignment
+                        hasattr(offender.value, 'name')
+                        offender_value = offender.value.name
+                    except (AttributeError, KeyError):
+                        break
+                    orig_offender = offender
+                    if offender_value.startswith('$'):
+                        offender = find_offender(offender_value,
+                                                 exhaustive=exhaustive)
+                        if offender is None:
+                            offender = orig_offender
+                    break
+            return offender
+
+        def diagnose_imprecision(offender):
+            # helper for diagnosing imprecise types
+
+            list_msg = """\n
+For Numba to be able to compile a list, the list must have a known and
+precise type that can be inferred from the other variables. Whilst sometimes
+the type of empty lists can be inferred, this is not always the case, see this
+documentation for help:
+
+http://numba.pydata.org/numba-doc/latest/user/troubleshoot.html#my-code-has-an-untyped-list-problem
+"""
+            if offender is not None:
+                # This block deals with imprecise lists
+                if hasattr(offender, 'value'):
+                    if hasattr(offender.value, 'op'):
+                        # might be `foo = []`
+                        if offender.value.op == 'build_list':
+                            return list_msg
+                        # or might be `foo = list()`
+                        elif offender.value.op == 'call':
+                            try: # assignment involving a call
+                                call_name = offender.value.func.name
+                                # find the offender based on the call name
+                                offender = find_offender(call_name)
+                                if isinstance(offender.value, ir.Global):
+                                    if offender.value.name == 'list':
+                                        return list_msg
+                            except (AttributeError, KeyError):
+                                pass
+            return "" # no help possible
+
         def check_var(name):
             tv = self.typevars[name]
             if not tv.defined:
-                offender = None
-                for block in self.func_ir.blocks.values():
-                    offender = block.find_variable_assignment(name)
-                    if offender is not None:
-                        break
+                offender = find_offender(name)
                 val = getattr(offender, 'value', 'unknown operation')
-                loc = getattr(offender, 'loc', 'unknown location')
-                msg = "Undefined variable '%s', operation: %s, location: %s"
+                loc = getattr(offender, 'loc', ir.unknown_loc)
+                msg = ("Type of variable '%s' cannot be determined, operation:"
+                      " %s, location: %s")
                 raise TypingError(msg % (var, val, loc), loc)
             tp = tv.getone()
             if not tp.is_precise():
-                raise TypingError("Can't infer type of variable '%s': %s" %
-                                  (var, tp))
-            typdict[var] = tp
+                offender = find_offender(name, exhaustive=True)
+                msg = ("Cannot infer the type of variable '%s'%s, "
+                      "have imprecise type: %s. %s")
+                istmp = " (temporary variable)" if var.startswith('$') else ""
+                loc = getattr(offender, 'loc', ir.unknown_loc)
+                # is this an untyped list? try and provide help
+                extra_msg = diagnose_imprecision(offender)
+                raise TypingError(msg % (var, istmp, tp, extra_msg), loc)
+            else: # type is precise, hold it
+                typdict[var] = tp
 
         # For better error display, check first user-visible vars, then
         # temporaries
@@ -980,7 +1038,7 @@ class TypeInferer(object):
                                     break
 
                     for name, offender in returns.items():
-                        loc = getattr(offender, 'loc', 'unknown location')
+                        loc = getattr(offender, 'loc', ir.unknown_loc)
                         msg = ("Return of: IR name '%s', type '%s', "
                                "location: %s")
                         interped = msg % (name, atype, loc.strformat())
@@ -1107,11 +1165,11 @@ class TypeInferer(object):
 
     def typeof_const(self, inst, target, const):
         ty = self.resolve_value_type(inst, const)
-        # Special case string constant as Const type
-        if ty == types.string:
-            ty = types.Const(value=const)
-        self.lock_type(target.name, ty, loc=inst.loc,
-                       literal_value=const)
+        if inst.value.use_literal_type:
+            lit = types.maybe_literal(value=const)
+        else:
+            lit = None
+        self.add_type(target.name, lit or ty, loc=inst.loc)
 
     def typeof_yield(self, inst, target, yield_):
         # Sending values into generators isn't supported.
@@ -1135,7 +1193,7 @@ class TypeInferer(object):
             raise TypingError("Modified builtin '%s'" % gvar.name,
                               loc=inst.loc)
 
-    def resolve_call(self, fnty, pos_args, kw_args, literals=None):
+    def resolve_call(self, fnty, pos_args, kw_args):
         """
         Resolve a call to a given function type.  A signature is returned.
         """
@@ -1169,8 +1227,7 @@ class TypeInferer(object):
             return sig
         else:
             # Normal non-recursive call
-            return self.context.resolve_function_type(fnty, pos_args, kw_args,
-                                                      literals=literals)
+            return self.context.resolve_function_type(fnty, pos_args, kw_args)
 
     def typeof_global(self, inst, target, gvar):
         try:
@@ -1204,8 +1261,8 @@ class TypeInferer(object):
         self.sentry_modified_builtin(inst, gvar)
         # Setting literal_value for globals because they are handled
         # like const value in numba
-        self.lock_type(target.name, typ, loc=inst.loc,
-                       literal_value=gvar.value)
+        lit = types.maybe_literal(gvar.value)
+        self.lock_type(target.name, lit or typ, loc=inst.loc)
         self.assumed_immutables.add(inst)
 
     def typeof_expr(self, inst, target, expr):
@@ -1247,8 +1304,9 @@ class TypeInferer(object):
             self.constraints.append(constraint)
             self.calls.append((inst.value, constraint))
         elif expr.op == 'getitem':
-            self.typeof_intrinsic_call(inst, target, 'getitem', expr.value,
-                                       expr.index)
+            self.typeof_intrinsic_call(
+                inst, target, operator.getitem, expr.value, expr.index,
+                )
         elif expr.op == 'getattr':
             constraint = GetAttrConstraint(target.name, attr=expr.attr,
                                            value=expr.value, loc=inst.loc,
@@ -1271,7 +1329,8 @@ class TypeInferer(object):
                                               src=expr.value.name,
                                               loc=inst.loc))
         elif expr.op == 'make_function':
-            self.lock_type(target.name, types.pyfunc_type, loc=inst.loc)
+            self.lock_type(target.name, types.MakeFunctionLiteral(expr),
+                           loc=inst.loc, literal_value=expr)
         else:
             msg = "Unsupported op-code encountered: %s" % expr
             raise UnsupportedError(msg, loc=inst.loc)

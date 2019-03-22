@@ -1,6 +1,6 @@
 from __future__ import absolute_import, print_function
 
-from collections import OrderedDict, Sequence
+from collections import OrderedDict
 import types as pytypes
 import inspect
 
@@ -13,7 +13,16 @@ from numba.typing import templates
 from numba.datamodel import default_manager, models
 from numba.targets import imputils
 from numba import cgutils, utils
+from numba.config import PYVERSION
 from numba.six import exec_
+
+
+if PYVERSION >= (3, 3):
+    from collections.abc import Sequence
+else:
+    from collections import Sequence
+
+
 from . import _box
 
 
@@ -66,11 +75,11 @@ def ctor({args}):
 
 def _getargs(fn):
     """
-    Returns list of positional and keyword argument names in order. 
+    Returns list of positional and keyword argument names in order.
     """
     sig = utils.pysignature(fn)
     params = sig.parameters
-    args = [k for k, v in params.items() 
+    args = [k for k, v in params.items()
             if (v.kind & v.POSITIONAL_OR_KEYWORD) == v.POSITIONAL_OR_KEYWORD]
     return args
 
@@ -136,6 +145,14 @@ def _fix_up_private_attr(clsname, spec):
             k = '_' + clsname + k
         out[k] = v
     return out
+
+def _add_linking_libs(context, call):
+    """
+    Add the required libs for the callable to allow inlining.
+    """
+    libs = getattr(call, "libs", ())
+    if libs:
+        context.add_linking_libs(libs)
 
 
 def register_class_type(cls, spec, class_ctor, builder):
@@ -296,8 +313,10 @@ class ClassBuilder(object):
             disp_type = types.Dispatcher(method)
             call = context.get_function(disp_type, sig)
             out = call(builder, args)
+            _add_linking_libs(context, call)
             return imputils.impl_ret_new_ref(context, builder,
                                              sig.return_type, out)
+
 
 
 @templates.infer_getattr
@@ -355,6 +374,7 @@ def attr_impl(context, builder, typ, value, attr):
         sig = dispatcher.get_call_type(context.typing_context, [typ], {})
         call = context.get_function(dispatcher, sig)
         out = call(builder, [value])
+        _add_linking_libs(context, call)
         return imputils.impl_ret_new_ref(context, builder, sig.return_type, out)
 
     raise NotImplementedError('attribute {0!r} not implemented'.format(attr))
@@ -394,7 +414,7 @@ def attr_impl(context, builder, sig, args, attr):
                                       (typ, valty), {})
         call = context.get_function(disp_type, sig)
         call(builder, (target, val))
-
+        _add_linking_libs(context, call)
     else:
         raise NotImplementedError('attribute {0!r} not implemented'.format(attr))
 
@@ -459,6 +479,7 @@ def ctor_impl(context, builder, sig, args):
     init = inst_typ.jitmethods['__init__']
     disp_type = types.Dispatcher(init)
     call = context.get_function(disp_type, types.void(*init_sig))
+    _add_linking_libs(context, call)
     realargs = [inst_struct._getvalue()] + list(args)
     call(builder, realargs)
 

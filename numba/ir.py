@@ -6,26 +6,31 @@ import itertools
 import os
 import linecache
 import pprint
+import re
 import sys
 import warnings
 from numba import config, errors
+import operator
 
-from . import utils
+from .utils import BINOPS_TO_OPERATORS, INPLACE_BINOPS_TO_OPERATORS, UNARY_BUITINS_TO_OPERATORS, OPERATORS_TO_BUILTINS
 from .errors import (NotDefinedError, RedefinedError, VerificationError,
                      ConstantInferenceError)
 
 # terminal color markup
 _termcolor = errors.termcolor()
 
+
 class Loc(object):
     """Source location
 
     """
+    _defmatcher = re.compile('def\s+(\w+)\(.*')
 
     def __init__(self, filename, line, col=None):
         self.filename = filename
         self.line = line
         self.col = col
+        self.lines = None # the source lines from the linecache
 
     @classmethod
     def from_function_id(cls, func_id):
@@ -41,7 +46,34 @@ class Loc(object):
         else:
             return "%s (%s)" % (self.filename, self.line)
 
-    def strformat(self, nlines_up=2):
+    def _find_definition(self):
+        # try and find a def, go backwards from error line
+        fn_name = None
+        lines = self._get_lines()
+        for x in reversed(lines[:self.line - 1]):
+            if 'def ' in x:
+                fn_name = x
+                break
+
+        return fn_name
+
+    def _raw_function_name(self):
+        defn = self._find_definition()
+        if defn:
+            return self._defmatcher.match(defn.strip()).groups()[0]
+        else:
+            # Probably exec(<string>) or REPL.
+            return None
+
+    def _get_lines(self):
+        if self.lines is None:
+
+            self.lines = linecache.getlines(self._get_path())
+
+        return self.lines
+
+    def _get_path(self):
+        path = None
         try:
             # Try to get a relative path
             # ipython/jupyter input just returns as self.filename
@@ -51,8 +83,12 @@ class Loc(object):
             # relative path.
             # This may happen on windows if the drive is different
             path = os.path.abspath(self.filename)
+        return path
 
-        lines = linecache.getlines(path)
+
+    def strformat(self, nlines_up=2):
+
+        lines = self._get_lines()
 
         ret = [] # accumulates output
         if lines and self.line:
@@ -63,7 +99,12 @@ class Loc(object):
                     spaces += 1
                 return spaces
 
-            selected = lines[self.line - nlines_up:self.line]
+            # A few places in the code still use no `loc` or default to line 1
+            # this is often in places where exceptions are used for the purposes
+            # of flow control. As a result max is in use to prevent slice from
+            # `[negative: positive]`
+            selected = lines[max(0, self.line - nlines_up):self.line]
+
             # see if selected contains a definition
             def_found = False
             for x in selected:
@@ -83,19 +124,20 @@ class Loc(object):
                     spaces = count_spaces(x)
                     ret.append(' '*(4 + spaces) + '<source elided>\n')
 
-            ret.extend(selected[:-1])
-            ret.append(_termcolor.highlight(selected[-1]))
+            if selected:
+                ret.extend(selected[:-1])
+                ret.append(_termcolor.highlight(selected[-1]))
 
-            # point at the problem with a caret
-            spaces = count_spaces(selected[-1])
-            ret.append(' '*(spaces) + _termcolor.indicate("^"))
+                # point at the problem with a caret
+                spaces = count_spaces(selected[-1])
+                ret.append(' '*(spaces) + _termcolor.indicate("^"))
 
         # if in the REPL source may not be available
         if not ret:
-            ret = "<source missing, REPL in use?>"
+            ret = "<source missing, REPL/exec in use?>"
 
         err = _termcolor.filename('\nFile "%s", line %d:')+'\n%s'
-        tmp = err % (path, self.line, _termcolor.code(''.join(ret)))
+        tmp = err % (self._get_path(), self.line, _termcolor.code(''.join(ret)))
         return tmp
 
     def with_lineno(self, line, col=None):
@@ -103,6 +145,10 @@ class Loc(object):
         Return a new Loc with this line number.
         """
         return type(self)(self.filename, line, col)
+
+
+# Used for annotating errors when source location is unknown.
+unknown_loc = Loc("unknown location", 0, 0)
 
 
 class VarMap(object):
@@ -225,12 +271,15 @@ class Expr(Inst):
 
     @classmethod
     def binop(cls, fn, lhs, rhs, loc):
+        assert not isinstance(fn, str)
         op = 'binop'
         return cls(op=op, loc=loc, fn=fn, lhs=lhs, rhs=rhs,
                    static_lhs=UNDEFINED, static_rhs=UNDEFINED)
 
     @classmethod
     def inplace_binop(cls, fn, immutable_fn, lhs, rhs, loc):
+        assert not isinstance(fn, str)
+        assert not isinstance(immutable_fn, str)
         op = 'inplace_binop'
         return cls(op=op, loc=loc, fn=fn, immutable_fn=immutable_fn,
                    lhs=lhs, rhs=rhs,
@@ -239,6 +288,7 @@ class Expr(Inst):
     @classmethod
     def unary(cls, fn, value, loc):
         op = 'unary'
+        fn = UNARY_BUITINS_TO_OPERATORS.get(fn, fn)
         return cls(op=op, loc=loc, fn=fn, value=value)
 
     @classmethod
@@ -333,7 +383,11 @@ class Expr(Inst):
             arglist = ', '.join(filter(None, [args, vararg, kws]))
             return 'call %s(%s)' % (self.func, arglist)
         elif self.op == 'binop':
-            return '%s %s %s' % (self.lhs, self.fn, self.rhs)
+            lhs, rhs = self.lhs, self.rhs
+            if self.fn == operator.contains:
+                lhs, rhs = rhs, lhs
+            fn = OPERATORS_TO_BUILTINS.get(self.fn, self.fn)
+            return '%s %s %s' % (lhs, fn, rhs)
         else:
             pres_order = self._kws.items() if config.DIFF_IR == 0 else sorted(self._kws.items())
             args = ('%s=%s' % (k, v) for k, v in pres_order)
@@ -564,6 +618,31 @@ class Yield(Inst):
         return [self.value]
 
 
+class EnterWith(Stmt):
+    """Enter a "with" context
+    """
+    def __init__(self, contextmanager, begin, end, loc):
+        """
+        Parameters
+        ----------
+        contextmanager : IR value
+        begin, end : int
+            The beginning and the ending offset of the with-body.
+        loc : int
+            Source location
+        """
+        self.contextmanager = contextmanager
+        self.begin = begin
+        self.end = end
+        self.loc = loc
+
+    def __str__(self):
+        return 'enter_with {}'.format(self.contextmanager)
+
+    def list_vars(self):
+        return [self.contextmanager]
+
+
 class Arg(object):
     def __init__(self, name, index, loc):
         self.name = name
@@ -578,9 +657,11 @@ class Arg(object):
 
 
 class Const(object):
-    def __init__(self, value, loc):
+    def __init__(self, value, loc, use_literal_type=True):
         self.value = value
         self.loc = loc
+        # Note: need better way to tell if this is a literal or not.
+        self.use_literal_type = use_literal_type
 
     def __repr__(self):
         return 'const(%s, %s)' % (type(self.value).__name__, self.value)
@@ -874,6 +955,8 @@ class Block(object):
 
 
 class Loop(object):
+    """Describes a loop-block
+    """
     __slots__ = "entry", "exit"
 
     def __init__(self, entry, exit):
@@ -883,6 +966,20 @@ class Loop(object):
     def __repr__(self):
         args = self.entry, self.exit
         return "Loop(entry=%s, exit=%s)" % args
+
+
+class With(object):
+    """Describes a with-block
+    """
+    __slots__ = "entry", "exit"
+
+    def __init__(self, entry, exit):
+        self.entry = entry
+        self.exit = exit
+
+    def __repr__(self):
+        args = self.entry, self.exit
+        return "With(entry=%s, exit=%s)" % args
 
 
 class FunctionIR(object):
@@ -1006,4 +1103,20 @@ class FunctionIR(object):
 
 
 # A stub for undefined global reference
-UNDEFINED = object()
+class UndefinedType(object):
+
+    _singleton = None
+
+    def __new__(cls):
+        obj = cls._singleton
+        if obj is not None:
+            return obj
+        else:
+            obj = object.__new__(cls)
+            cls._singleton = obj
+        return obj
+
+    def __repr__(self):
+        return "Undefined"
+
+UNDEFINED = UndefinedType()

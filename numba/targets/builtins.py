@@ -4,6 +4,7 @@ import math
 from functools import reduce
 
 import numpy as np
+import operator
 
 from llvmlite import ir
 from llvmlite.llvmpy.core import Type, Constant
@@ -16,16 +17,16 @@ from .imputils import (lower_builtin, lower_getattr, lower_getattr_generic,
 from .. import typing, types, cgutils, utils
 
 
-@lower_builtin('is not', types.Any, types.Any)
+@lower_builtin(operator.is_not, types.Any, types.Any)
 def generic_is_not(context, builder, sig, args):
     """
     Implement `x is not y` as `not (x is y)`.
     """
-    is_impl = context.get_function('is', sig)
+    is_impl = context.get_function(operator.is_, sig)
     return builder.not_(is_impl(builder, args))
 
 
-@lower_builtin('is', types.Any, types.Any)
+@lower_builtin(operator.is_, types.Any, types.Any)
 def generic_is(context, builder, sig, args):
     """
     Default implementation for `x is y`
@@ -40,7 +41,7 @@ def generic_is(context, builder, sig, args):
             else:
                 # fallbacks to `==`
                 try:
-                    eq_impl = context.get_function('==', sig)
+                    eq_impl = context.get_function(operator.eq, sig)
                 except NotImplementedError:
                     # no `==` implemented for this type
                     return cgutils.false_bit
@@ -48,6 +49,28 @@ def generic_is(context, builder, sig, args):
                     return eq_impl(builder, args)
     else:
         return cgutils.false_bit
+
+
+@lower_builtin(operator.eq, types.Literal, types.Literal)
+@lower_builtin(operator.eq, types.IntegerLiteral, types.IntegerLiteral)
+def const_eq_impl(context, builder, sig, args):
+    arg1, arg2 = sig.args
+    val = 0
+    if arg1.literal_value == arg2.literal_value:
+        val = 1
+    res = ir.Constant(ir.IntType(1), val)
+    return impl_ret_untracked(context, builder, sig.return_type, res)
+
+
+@lower_builtin(operator.ne, types.StringLiteral, types.StringLiteral)
+def const_ne_impl(context, builder, sig, args):
+    arg1, arg2 = sig.args
+    val = 0
+    if arg1.literal_value != arg2.literal_value:
+        val = 1
+    res = ir.Constant(ir.IntType(1), val)
+    return impl_ret_untracked(context, builder, sig.return_type, res)
+
 
 #-------------------------------------------------------------------------------
 
@@ -80,7 +103,7 @@ def deferred_to_any(context, builder, fromty, toty, val):
 
 #------------------------------------------------------------------------------
 
-@lower_builtin('getitem', types.CPointer, types.Integer)
+@lower_builtin(operator.getitem, types.CPointer, types.Integer)
 def getitem_cpointer(context, builder, sig, args):
     base_ptr, idx = args
     elem_ptr = builder.gep(base_ptr, [idx])
@@ -88,7 +111,7 @@ def getitem_cpointer(context, builder, sig, args):
     return impl_ret_borrowed(context, builder, sig.return_type, res)
 
 
-@lower_builtin('setitem', types.CPointer, types.Integer, types.Any)
+@lower_builtin(operator.setitem, types.CPointer, types.Integer, types.Any)
 def setitem_cpointer(context, builder, sig, args):
     base_ptr, idx, val = args
     elem_ptr = builder.gep(base_ptr, [idx])
@@ -125,21 +148,21 @@ def do_minmax(context, builder, argtys, args, cmpop):
 def max_iterable(context, builder, sig, args):
     argtys = list(sig.args[0])
     args = cgutils.unpack_tuple(builder, args[0])
-    return do_minmax(context, builder, argtys, args, '>')
+    return do_minmax(context, builder, argtys, args, operator.gt)
 
 @lower_builtin(max, types.VarArg(types.Any))
 def max_vararg(context, builder, sig, args):
-    return do_minmax(context, builder, sig.args, args, '>')
+    return do_minmax(context, builder, sig.args, args, operator.gt)
 
 @lower_builtin(min, types.BaseTuple)
 def min_iterable(context, builder, sig, args):
     argtys = list(sig.args[0])
     args = cgutils.unpack_tuple(builder, args[0])
-    return do_minmax(context, builder, argtys, args, '<')
+    return do_minmax(context, builder, argtys, args, operator.lt)
 
 @lower_builtin(min, types.VarArg(types.Any))
 def min_vararg(context, builder, sig, args):
-    return do_minmax(context, builder, sig.args, args, '<')
+    return do_minmax(context, builder, sig.args, args, operator.lt)
 
 
 def _round_intrinsic(tp):
@@ -238,6 +261,7 @@ def complex_impl(context, builder, sig, args):
 
 
 @lower_builtin(types.NumberClass, types.Any)
+@lower_builtin(types.TypeRef, types.Any)
 def number_constructor(context, builder, sig, args):
     """
     Call a number class, e.g. np.int32(...)
@@ -305,7 +329,7 @@ def next_impl(context, builder, sig, args):
 @lower_builtin("not in", types.Any, types.Any)
 def not_in(context, builder, sig, args):
     def in_impl(a, b):
-        return a in b
+        return operator.contains(b, a)
 
     res = context.compile_internal(builder, in_impl, sig, args)
     return builder.not_(res)
@@ -328,6 +352,17 @@ def sized_bool(context, builder, sig, args):
         return cgutils.true_bit
     else:
         return cgutils.false_bit
+
+@lower_builtin(tuple)
+def lower_empty_tuple(context, builder, sig, args):
+    retty = sig.return_type
+    res = context.get_constant_undef(retty)
+    return impl_ret_untracked(context, builder, sig.return_type, res)
+
+@lower_builtin(tuple, types.BaseTuple)
+def lower_tuple(context, builder, sig, args):
+    val, = args
+    return impl_ret_untracked(context, builder, sig.return_type, val)
 
 # -----------------------------------------------------------------------------
 
@@ -413,9 +448,9 @@ def impl_index_value(context, builder, sig, args):
     return index_value._getvalue()
 
 @overload(min)
-def indval_min(*args):
-    if len(args) == 2 and (isinstance(args[0], IndexValueType)
-                        and isinstance(args[1], IndexValueType)):
+def indval_min(indval1, indval2):
+    if isinstance(indval1, IndexValueType) and \
+       isinstance(indval2, IndexValueType):
         def min_impl(indval1, indval2):
             if indval1.value > indval2.value:
                 return indval2
@@ -423,9 +458,9 @@ def indval_min(*args):
         return min_impl
 
 @overload(max)
-def indval_max(*args):
-    if len(args) == 2 and (isinstance(args[0], IndexValueType)
-                        and isinstance(args[1], IndexValueType)):
+def indval_max(indval1, indval2):
+    if isinstance(indval1, IndexValueType) and \
+       isinstance(indval2, IndexValueType):
         def max_impl(indval1, indval2):
             if indval2.value > indval1.value:
                 return indval2

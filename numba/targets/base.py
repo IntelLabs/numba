@@ -5,6 +5,7 @@ import copy
 import os
 import sys
 from itertools import permutations, takewhile
+from contextlib import contextmanager
 
 import numpy as np
 
@@ -15,6 +16,7 @@ import llvmlite.binding as ll
 
 from numba import types, utils, cgutils, typing, funcdesc, debuginfo
 from numba import _dynfunc, _helperlib
+from numba.compiler_lock import global_compiler_lock
 from numba.pythonapi import PythonAPI
 from . import arrayobj, builtins, imputils
 from .imputils import (user_function, user_generator,
@@ -240,6 +242,7 @@ class BaseContext(object):
         self.special_ops = {}
         self.cached_internal_func = {}
         self._pid = None
+        self._codelib_stack = []
 
         self.data_model_manager = datamodel.default_manager
 
@@ -259,7 +262,7 @@ class BaseContext(object):
         # Populate built-in registry
         from . import (arraymath, enumimpl, iterators, linalg, numbers,
                        optional, polynomial, rangeobj, slicing, smartarray,
-                       tupleobj)
+                       tupleobj, gdb_hook, hashing, heapq)
         try:
             from . import npdatetime
         except NotImplementedError:
@@ -429,6 +432,16 @@ class BaseContext(object):
         gv = self.insert_unique_const(mod, name, text)
         return Constant.bitcast(gv, stringtype)
 
+    def insert_const_bytes(self, mod, bytes, name=None):
+        """
+        Insert constant *byte* (a `bytes` object) into module *mod*.
+        """
+        stringtype = GENERIC_POINTER
+        name = ".bytes.%s" % (name or hash(bytes))
+        text = cgutils.make_bytearray(bytes)
+        gv = self.insert_unique_const(mod, name, text)
+        return Constant.bitcast(gv, stringtype)
+
     def insert_unique_const(self, mod, name, val):
         """
         Insert a unique internal constant named *name*, with LLVM value
@@ -509,6 +522,7 @@ class BaseContext(object):
         Return the implementation of function *fn* for signature *sig*.
         The return value is a callable with the signature (builder, args).
         """
+        assert sig is not None
         sig = sig.as_function()
         if isinstance(fn, (types.Function, types.BoundFunction,
                            types.Dispatcher)):
@@ -546,7 +560,9 @@ class BaseContext(object):
     def get_generator_impl(self, genty):
         """
         """
-        return self._generators[genty][1]
+        res = self._generators[genty][1]
+        self.add_linking_libs(getattr(res, 'libs', ()))
+        return res
 
     def get_bound_function(self, builder, obj, ty):
         assert self.get_value_type(ty) == obj.type
@@ -690,8 +706,10 @@ class BaseContext(object):
         assert ty is not None
         cav = self.cast(builder, av, at, ty)
         cbv = self.cast(builder, bv, bt, ty)
-        cmpsig = typing.signature(types.boolean, ty, ty)
-        cmpfunc = self.get_function(key, cmpsig)
+        fnty = self.typing_context.resolve_value_type(key)
+        cmpsig = fnty.get_call_type(self.typing_context, argtypes, {})
+        cmpfunc = self.get_function(fnty, cmpsig)
+        self.add_linking_libs(getattr(cmpfunc, 'libs', ()))
         return cmpfunc(builder, (cav, cbv))
 
     def make_optional_none(self, builder, valtype):
@@ -775,7 +793,8 @@ class BaseContext(object):
     def get_dummy_type(self):
         return GENERIC_POINTER
 
-    def compile_subroutine_no_cache(self, builder, impl, sig, locals={}, flags=None):
+    def _compile_subroutine_no_cache(self, builder, impl, sig, locals={},
+                                     flags=None):
         """
         Invoke the compiler to compile a function to be used inside a
         nopython function, but without generating code to call that
@@ -786,48 +805,59 @@ class BaseContext(object):
         # Compile
         from numba import compiler
 
-        codegen = self.codegen()
-        library = codegen.create_library(impl.__name__)
-        if flags is None:
-            flags = compiler.Flags()
-        flags.set('no_compile')
-        flags.set('no_cpython_wrapper')
-        cres = compiler.compile_internal(self.typing_context, self,
-                                         library,
-                                         impl, sig.args,
-                                         sig.return_type, flags,
-                                         locals=locals)
+        with global_compiler_lock:
+            codegen = self.codegen()
+            library = codegen.create_library(impl.__name__)
+            if flags is None:
+                flags = compiler.Flags()
+            flags.set('no_compile')
+            flags.set('no_cpython_wrapper')
+            cres = compiler.compile_internal(self.typing_context, self,
+                                            library,
+                                            impl, sig.args,
+                                            sig.return_type, flags,
+                                            locals=locals)
 
-        # Allow inlining the function inside callers.
-        codegen.add_linking_library(cres.library)
-        return cres
+            # Allow inlining the function inside callers.
+            self.active_code_library.add_linking_library(cres.library)
+            return cres
 
-    def compile_subroutine(self, builder, impl, sig, locals={}):
+    def compile_subroutine(self, builder, impl, sig, locals={}, flags=None,
+                           caching=True):
         """
         Compile the function *impl* for the given *sig* (in nopython mode).
-        Return a placeholder object that's callable from another Numba
-        function.
+        Return an instance of CompileResult.
+
+        If *caching* evaluates True, the function keeps the compiled function
+        for reuse in *.cached_internal_func*.
         """
         cache_key = (impl.__code__, sig, type(self.error_model))
-        if impl.__closure__:
-            # XXX This obviously won't work if a cell's value is
-            # unhashable.
-            cache_key += tuple(c.cell_contents for c in impl.__closure__)
-        ty = self.cached_internal_func.get(cache_key)
-        if ty is None:
-            cres = self.compile_subroutine_no_cache(builder, impl, sig,
-                                                    locals=locals)
-            ty = types.NumbaFunction(cres.fndesc, sig)
-            self.cached_internal_func[cache_key] = ty
-        return ty
+        if not caching:
+            cached = None
+        else:
+            if impl.__closure__:
+                # XXX This obviously won't work if a cell's value is
+                # unhashable.
+                cache_key += tuple(c.cell_contents for c in impl.__closure__)
+            cached = self.cached_internal_func.get(cache_key)
+        if cached is None:
+            cres = self._compile_subroutine_no_cache(builder, impl, sig,
+                                                     locals=locals,
+                                                     flags=flags)
+            self.cached_internal_func[cache_key] = cres
+
+        cres = self.cached_internal_func[cache_key]
+        # Allow inlining the function inside callers.
+        self.active_code_library.add_linking_library(cres.library)
+        return cres
 
     def compile_internal(self, builder, impl, sig, args, locals={}):
         """
         Like compile_subroutine(), but also call the function with the given
         *args*.
         """
-        ty = self.compile_subroutine(builder, impl, sig, locals)
-        return self.call_internal(builder, ty.fndesc, sig, args)
+        cres = self.compile_subroutine(builder, impl, sig, locals)
+        return self.call_internal(builder, cres.fndesc, sig, args)
 
     def call_internal(self, builder, fndesc, sig, args):
         """
@@ -1062,6 +1092,29 @@ class BaseContext(object):
         """
         return lc.Module(name)
 
+    @property
+    def active_code_library(self):
+        """Get the active code library
+        """
+        return self._codelib_stack[-1]
+
+    @contextmanager
+    def push_code_library(self, lib):
+        """Push the active code library for the context
+        """
+        self._codelib_stack.append(lib)
+        try:
+            yield
+        finally:
+            self._codelib_stack.pop()
+
+    def add_linking_libs(self, libs):
+        """Add iterable of linking librarys to the *active_code_library*.
+        """
+        colib = self.active_code_library
+        for lib in libs:
+            colib.add_linking_library(lib)
+
 
 class _wrap_impl(object):
     """
@@ -1071,15 +1124,50 @@ class _wrap_impl(object):
     """
 
     def __init__(self, imp, context, sig):
-        self._imp = imp
+        self._imp = _wrap_missing_loc(imp)
         self._context = context
         self._sig = sig
 
-    def __call__(self, builder, args):
-        return self._imp(self._context, builder, self._sig, args)
+    def __call__(self, builder, args, loc=None):
+        res = self._imp(self._context, builder, self._sig, args, loc=loc)
+        self._context.add_linking_libs(getattr(self, 'libs', ()))
+        return res
 
     def __getattr__(self, item):
         return getattr(self._imp, item)
 
     def __repr__(self):
         return "<wrapped %s>" % self._imp
+
+
+def _has_loc(fn):
+    """Does function *fn* take ``loc`` argument?
+    """
+    sig = utils.pysignature(fn)
+    return 'loc' in sig.parameters
+
+
+def _wrap_missing_loc(fn):
+    """Wrap function for missing ``loc`` keyword argument.
+    Otherwise, return the original *fn*.
+    """
+    if not _has_loc(fn):
+        def wrapper(*args, **kwargs):
+            kwargs.pop('loc')     # drop unused loc
+            return fn(*args, **kwargs)
+
+        # Copy the following attributes from the wrapped.
+        # Following similar implementation as functools.wraps but
+        # ignore attributes if not available (i.e fix py2.7)
+        attrs = '__name__', 'libs'
+        for attr in attrs:
+            try:
+                val = getattr(fn, attr)
+            except AttributeError:
+                pass
+            else:
+                setattr(wrapper, attr, val)
+
+        return wrapper
+    else:
+        return fn

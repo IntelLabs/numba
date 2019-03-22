@@ -1,8 +1,10 @@
 from __future__ import print_function
 
 import numba.unittest_support as unittest
+from .support import TestCase
 
 import sys
+import operator
 
 # deliberately imported twice for different use cases
 import numpy as np
@@ -12,6 +14,7 @@ from numba.compiler import compile_isolated
 from numba import types, utils, jit, types
 from numba.errors import TypingError, LoweringError
 from .support import tag
+from numba.tests.support import captured_stdout
 
 from .test_parfors import _windows_py27, _32bit
 
@@ -25,7 +28,7 @@ def comp_list(n):
     return s
 
 
-class TestListComprehension(unittest.TestCase):
+class TestListComprehension(TestCase):
 
     @tag('important')
     def test_comp_list(self):
@@ -107,7 +110,6 @@ class TestListComprehension(unittest.TestCase):
                 return [y + l[0] for y in x]
             return inner(l)
 
-        # expected fail, nested mem managed object
         def list11(x):
             """ Test scalar array construction in list comprehension """
             l = [np.array(z) for z in x]
@@ -227,7 +229,22 @@ class TestListComprehension(unittest.TestCase):
             msg = "Cannot unify reflected list(int%d) and int%d" % (bits, bits)
             self.assertIn(msg, str(raises.exception))
 
+    def test_objmode_inlining(self):
+        def objmode_func(y):
+            z = object()
+            inlined = [x for x in y]
+            return inlined
+
+        cfunc = jit(forceobj=True)(objmode_func)
+        t = [1, 2, 3]
+        expected = objmode_func(t)
+        got = cfunc(t)
+        self.assertPreciseEqual(expected, got)
+
+
 class TestArrayComprehension(unittest.TestCase):
+
+    _numba_parallel_test_ = False
 
     def check(self, pyfunc, *args, **kwargs):
         """A generic check function that run both pyfunc, and jitted pyfunc,
@@ -355,7 +372,10 @@ class TestArrayComprehension(unittest.TestCase):
         # test is expected to fail
         with self.assertRaises(TypingError) as raises:
             self.check(comp_nest_with_dependency, 5)
-        self.assertIn('Cannot resolve setitem', str(raises.exception))
+        self.assertIn(
+            'Invalid use of Function({})'.format(operator.setitem),
+            str(raises.exception),
+        )
 
     @tag('important')
     def test_no_array_comp(self):
@@ -442,9 +462,36 @@ class TestArrayComprehension(unittest.TestCase):
         with self.assertRaises(TypingError) as raises:
             cfunc = jit(nopython=True)(array_comp)
             cfunc(10, 2.3j)
-        self.assertIn("setitem: array({}, 1d, C)[0] = complex128".format(types.intp),
-                      str(raises.exception))
+        self.assertIn(
+            "Invalid use of Function({})".format(operator.setitem),
+            str(raises.exception),
+        )
+        self.assertIn(
+            "(array({}, 1d, C), Literal[int](0), complex128)".format(types.intp),
+            str(raises.exception),
+        )
 
+    def test_array_comp_shuffle_sideeffect(self):
+        nelem = 100
+
+        @jit(nopython=True)
+        def foo():
+            numbers = np.array([i for i in range(nelem)])
+            np.random.shuffle(numbers)
+            print(numbers)
+
+        with captured_stdout() as gotbuf:
+            foo()
+        got = gotbuf.getvalue().strip()
+
+        with captured_stdout() as expectbuf:
+            print(np.array([i for i in range(nelem)]))
+        expect = expectbuf.getvalue().strip()
+
+        # For a large enough array, the chances of shuffle to not move any
+        # element is tiny enough.
+        self.assertNotEqual(got, expect)
+        self.assertRegexpMatches(got, r'\[(\s*\d+)+\]')
 
 
 if __name__ == '__main__':

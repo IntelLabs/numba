@@ -17,6 +17,7 @@ from numba.targets.imputils import lower_builtin
 from numba.extending import register_jitable
 from numba.six import exec_
 
+import operator
 
 class StencilFuncLowerer(object):
     '''Callable class responsible for lowering calls to a specific StencilFunc.
@@ -27,7 +28,9 @@ class StencilFuncLowerer(object):
     def __call__(self, context, builder, sig, args):
         cres = self.stencilFunc.compile_for_argtys(sig.args, {},
                     sig.return_type, None)
-        return context.call_internal(builder, cres.fndesc, sig, args)
+        res = context.call_internal(builder, cres.fndesc, sig, args)
+        context.add_linking_libs([cres.library])
+        return res
 
 @register_jitable
 def raise_if_incompatible_array_sizes(a, *args):
@@ -182,8 +185,8 @@ class StencilFunc(object):
                         elif stmt_index_var.name in const_dict:
                             kernel_consts += [const_dict[stmt_index_var.name]]
                         else:
-                            raise ValueError("Non-constant specified for "
-                                             "stencil kernel index.")
+                            raise ValueError("stencil kernel index is not "
+                                "constant, 'neighborhood' option required")
 
                     if ndim == 1:
                         # Single dimension always has index variable 'index0'.
@@ -193,7 +196,7 @@ class StencilFunc(object):
                         index_var = ir.Var(scope, index_names[0], loc)
                         tmpname = ir_utils.mk_unique_var("stencil_index")
                         tmpvar  = ir.Var(scope, tmpname, loc)
-                        acc_call = ir.Expr.binop('+', stmt_index_var,
+                        acc_call = ir.Expr.binop(operator.add, stmt_index_var,
                                                  index_var, loc)
                         new_body.append(ir.Assign(acc_call, tmpvar, loc))
                         new_body.append(ir.Assign(
@@ -229,7 +232,7 @@ class StencilFunc(object):
                             getitemcall = ir.Expr.getitem(stmt_index_var,
                                                        const_index_vars[dim], loc)
                             new_body.append(ir.Assign(getitemcall, getitemvar, loc))
-                            acc_call = ir.Expr.binop('+', getitemvar,
+                            acc_call = ir.Expr.binop(operator.add, getitemvar,
                                                      index_vars[dim], loc)
                             new_body.append(ir.Assign(acc_call, tmpvar, loc))
 
@@ -261,7 +264,8 @@ class StencilFunc(object):
                             neighborhood[i][1] = max(neighborhood[i][1], te)
                         else:
                             raise ValueError(
-                                "Non-constant used as stencil index.")
+                                "stencil kernel index is not constant,"
+                                "'neighborhood' option required")
                     index_len = len(index)
                 elif isinstance(index, int):
                     neighborhood[0][0] = min(neighborhood[0][0], index)
@@ -527,19 +531,28 @@ class StencilFunc(object):
         # then us numpy.full if the user specified a cval stencil decorator option
         # or np.zeros if they didn't to allocate the array.
         if result is None:
+            return_type_name = numpy_support.as_dtype(
+                               return_type.dtype).type.__name__
             if "cval" in self.options:
                 cval = self.options["cval"]
                 if return_type.dtype != typing.typeof.typeof(cval):
                     raise ValueError(
                         "cval type does not match stencil return type.")
-
                 out_init ="{} = np.full({}, {}, dtype=np.{})\n".format(
-                            out_name, shape_name, cval, return_type.dtype)
-
+                            out_name, shape_name, cval, return_type_name)
             else:
                 out_init ="{} = np.zeros({}, dtype=np.{})\n".format(
-                            out_name, shape_name, return_type.dtype)
+                            out_name, shape_name, return_type_name)
             func_text += "    " + out_init
+        else: # result is present, if cval is set then use it
+            if "cval" in self.options:
+                cval = self.options["cval"]
+                cval_ty = typing.typeof.typeof(cval)
+                if not self._typingctx.can_convert(cval_ty, return_type.dtype):
+                    msg = "cval type does not match stencil return type."
+                    raise ValueError(msg)
+                out_init = "{}[:] = {}\n".format(out_name, cval)
+                func_text += "    " + out_init
 
         offset = 1
         # Add the loop nests to the new function.

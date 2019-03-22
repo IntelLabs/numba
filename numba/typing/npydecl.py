@@ -3,6 +3,7 @@ from __future__ import absolute_import, print_function
 import warnings
 
 import numpy as np
+import operator
 
 from .. import types, utils
 from .templates import (AttributeTemplate, AbstractTemplate, CallableTemplate,
@@ -70,6 +71,10 @@ class Numpy_rules_ufunc(AbstractTemplate):
         if not all(isinstance(output, types.ArrayCompatible)
                    for output in explicit_outputs):
             msg = "ufunc '{0}' called with an explicit output that is not an array"
+            raise TypingError(msg=msg.format(ufunc.__name__))
+
+        if not all(output.mutable for output in explicit_outputs):
+            msg = "ufunc '{0}' called with an explicit output that is read-only"
             raise TypingError(msg=msg.format(ufunc.__name__))
 
         # find the kernel to use, based only in the input types (as does NumPy)
@@ -141,14 +146,14 @@ class Numpy_rules_ufunc(AbstractTemplate):
         return signature(*out)
 
 
-@infer
+@infer_global(operator.pos)
 class UnaryPositiveArray(AbstractTemplate):
     '''Typing template class for +(array) expressions.  This operator is
     special because there is no Numpy ufunc associated with it; we
     include typing for it here (numba.typing.npydecl) because this is
     where the remaining array operators are defined.
     '''
-    key = "+"
+    key = operator.pos
 
     def generic(self, args, kws):
         assert not kws
@@ -159,26 +164,28 @@ class UnaryPositiveArray(AbstractTemplate):
 
 class NumpyRulesArrayOperator(Numpy_rules_ufunc):
     _op_map = {
-         '+': "add",
-         '-': "subtract",
-         '*': "multiply",
-        '/?': "divide",
-         '/': "true_divide",
-        '//': "floor_divide",
-         '%': "remainder",
-        '**': "power",
-        '<<': "left_shift",
-        '>>': "right_shift",
-         '&': "bitwise_and",
-         '|': "bitwise_or",
-         '^': "bitwise_xor",
-        '==': "equal",
-         '>': "greater",
-        '>=': "greater_equal",
-         '<': "less",
-        '<=': "less_equal",
-        '!=': "not_equal",
+        operator.add: "add",
+        operator.sub: "subtract",
+        operator.mul: "multiply",
+        operator.truediv: "true_divide",
+        operator.floordiv: "floor_divide",
+        operator.mod: "remainder",
+        operator.pow: "power",
+        operator.lshift: "left_shift",
+        operator.rshift: "right_shift",
+        operator.and_: "bitwise_and",
+        operator.or_: "bitwise_or",
+        operator.xor: "bitwise_xor",
+        operator.eq: "equal",
+        operator.gt: "greater",
+        operator.ge: "greater_equal",
+        operator.lt: "less",
+        operator.le: "less_equal",
+        operator.ne: "not_equal",
     }
+
+    if not utils.IS_PY3:
+        _op_map[operator.div] = "divide"
 
     @property
     def ufunc(self):
@@ -187,8 +194,9 @@ class NumpyRulesArrayOperator(Numpy_rules_ufunc):
     @classmethod
     def install_operations(cls):
         for op, ufunc_name in cls._op_map.items():
-            infer(type("NumpyRulesArrayOperator_" + ufunc_name, (cls,),
-                         dict(key=op)))
+            infer_global(op)(
+                type("NumpyRulesArrayOperator_" + ufunc_name, (cls,), dict(key=op))
+            )
 
     def generic(self, args, kws):
         '''Overloads and calls base class generic() method, returning
@@ -217,9 +225,23 @@ class NumpyRulesArrayOperator(Numpy_rules_ufunc):
 _binop_map = NumpyRulesArrayOperator._op_map
 
 class NumpyRulesInplaceArrayOperator(NumpyRulesArrayOperator):
-    _op_map = dict((inp, _binop_map[binop])
-                   for (inp, binop) in utils.inplace_map.items()
-                   if binop in _binop_map)
+    _op_map = {
+        operator.iadd: "add",
+        operator.isub: "subtract",
+        operator.imul: "multiply",
+        operator.itruediv: "true_divide",
+        operator.ifloordiv: "floor_divide",
+        operator.imod: "remainder",
+        operator.ipow: "power",
+        operator.ilshift: "left_shift",
+        operator.irshift: "right_shift",
+        operator.iand: "bitwise_and",
+        operator.ior: "bitwise_or",
+        operator.ixor: "bitwise_xor",
+    }
+
+    if not utils.IS_PY3:
+        _op_map[operator.idiv] = "divide"
 
     def generic(self, args, kws):
         # Type the inplace operator as if an explicit output was passed,
@@ -242,8 +264,8 @@ class NumpyRulesUnaryArrayOperator(NumpyRulesArrayOperator):
         # Positive is a special case since there is no Numpy ufunc
         # corresponding to it (it's essentially an identity operator).
         # See UnaryPositiveArray, above.
-        '-': "negative",
-        '~': "invert",
+        operator.neg: "negative",
+        operator.invert: "invert",
     }
 
     def generic(self, args, kws):
@@ -331,8 +353,12 @@ NumpyRulesArrayOperator.install_operations()
 NumpyRulesInplaceArrayOperator.install_operations()
 
 supported_array_operators = set(
-    NumpyRulesUnaryArrayOperator._op_map.keys()).union(
-        NumpyRulesArrayOperator._op_map.keys())
+    NumpyRulesUnaryArrayOperator._op_map.keys()
+).union(
+    NumpyRulesArrayOperator._op_map.keys()
+).union(
+    NumpyRulesInplaceArrayOperator._op_map.keys()
+)
 
 del _math_operations, _trigonometric_functions, _bit_twiddling_functions
 del _comparison_functions, _floating_functions, _unsupported
@@ -378,9 +404,6 @@ def _numpy_redirect(fname):
     cls = type("Numpy_redirect_{0}".format(fname), (Numpy_method_redirection,),
                dict(key=numpy_function, method_name=fname))
     infer_global(numpy_function, types.Function(cls))
-    # special case literal support for 'sum'
-    if fname in ['sum', 'argsort']:
-        cls.support_literals = True
 
 for func in ['min', 'max', 'sum', 'prod', 'mean', 'var', 'std',
              'cumsum', 'cumprod', 'argmin', 'argmax', 'argsort',
@@ -391,7 +414,7 @@ for func in ['min', 'max', 'sum', 'prod', 'mean', 'var', 'std',
 # -----------------------------------------------------------------------------
 # Numpy scalar constructors
 
-# Register np.int8, etc. as convertors to the equivalent Numba types
+# Register np.int8, etc. as converters to the equivalent Numba types
 np_types = set(getattr(np, str(nb_type)) for nb_type in types.number_domain)
 np_types.add(np.bool_)
 # Those may or may not be aliases (depending on the Numpy build / version)
@@ -599,21 +622,6 @@ class NdIdentity(AbstractTemplate):
 
 def _infer_dtype_from_inputs(inputs):
     return dtype
-
-
-@infer_global(np.eye)
-class NdEye(CallableTemplate):
-
-    def generic(self):
-        def typer(N, M=None, k=None, dtype=None):
-            if dtype is None:
-                nb_dtype = types.float64
-            else:
-                nb_dtype = _parse_dtype(dtype)
-            if nb_dtype is not None:
-                return types.Array(ndim=2, dtype=nb_dtype, layout='C')
-
-        return typer
 
 
 @infer_global(np.arange)
@@ -1006,17 +1014,17 @@ class VDot(CallableTemplate):
 
         return typer
 
+if utils.HAS_MATMUL_OPERATOR:
+    @infer_global(operator.matmul)
+    class MatMul(MatMulTyperMixin, AbstractTemplate):
+        key = operator.matmul
+        func_name = "'@'"
 
-@infer
-class MatMul(MatMulTyperMixin, AbstractTemplate):
-    key = "@"
-    func_name = "'@'"
-
-    def generic(self, args, kws):
-        assert not kws
-        restype = self.matmul_typer(*args)
-        if restype is not None:
-            return signature(restype, *args)
+        def generic(self, args, kws):
+            assert not kws
+            restype = self.matmul_typer(*args)
+            if restype is not None:
+                return signature(restype, *args)
 
 
 def _check_linalg_matrix(a, func_name):
@@ -1133,18 +1141,27 @@ class Where(AbstractTemplate):
             return signature(retty, ary)
 
         elif len(args) == 3:
-            # NOTE: contrary to Numpy, we only support homogeneous arguments
             cond, x, y = args
+            retdty = from_dtype(np.promote_types(
+                        as_dtype(getattr(args[1], 'dtype', args[1])),
+                        as_dtype(getattr(args[2], 'dtype', args[2]))))
             if isinstance(cond, types.Array):
                 # array where()
-                if (cond.ndim == x.ndim == y.ndim and
-                    x.dtype == y.dtype):
-                    retty = types.Array(x.dtype, x.ndim, x.layout)
+                if isinstance(x, types.Array) and isinstance(y, types.Array):
+                    if (cond.ndim == x.ndim == y.ndim):
+                        if x.layout == y.layout == cond.layout:
+                            retty = types.Array(retdty, x.ndim, x.layout)
+                        else:
+                            retty = types.Array(retdty, x.ndim, 'C')
+                        return signature(retty, *args)
+                else:
+                    # x and y both scalar
+                    retty = types.Array(retdty, cond.ndim, cond.layout)
                     return signature(retty, *args)
             else:
                 # scalar where()
-                if not isinstance(x, types.Array) and x == y:
-                    retty = types.Array(x, 0, 'C')
+                if not isinstance(x, types.Array):
+                    retty = types.Array(retdty, 0, 'C')
                     return signature(retty, *args)
 
 
@@ -1200,7 +1217,8 @@ class DiagCtor(CallableTemplate):
                     rdim = 1
                 else:
                     return None
-                return types.Array(ndim=rdim, dtype=ref.dtype, layout='C')
+                if isinstance(k, (int, types.Integer)):
+                    return types.Array(ndim=rdim, dtype=ref.dtype, layout='C')
         return typer
 
 

@@ -7,6 +7,7 @@ from __future__ import print_function, absolute_import, division
 import math
 from collections import namedtuple
 from enum import IntEnum
+from functools import partial
 
 import numpy as np
 
@@ -14,7 +15,7 @@ from llvmlite import ir
 import llvmlite.llvmpy.core as lc
 from llvmlite.llvmpy.core import Constant, Type
 
-from numba import types, cgutils, typing
+from numba import types, cgutils, typing, generated_jit
 from numba.extending import overload, overload_method, register_jitable
 from numba.numpy_support import as_dtype
 from numba.numpy_support import version as numpy_version
@@ -25,7 +26,7 @@ from .arrayobj import make_array, load_item, store_item, _empty_nd_impl
 from .linalg import ensure_blas
 
 from numba.extending import intrinsic
-from numba.errors import RequireConstValue, TypingError
+from numba.errors import RequireLiteralValue, TypingError
 
 def _check_blas():
     # Checks if a BLAS is available so e.g. dot will work
@@ -77,7 +78,7 @@ def _create_tuple_result_shape(tyctx, shape_list, shape_tuple):
 
     return function_sig, codegen
 
-@intrinsic(support_literals=True)
+@intrinsic
 def _gen_index_tuple(tyctx, shape_tuple, value, axis):
     """
     Generates a tuple that can be used to index a specific slice from an
@@ -86,10 +87,10 @@ def _gen_index_tuple(tyctx, shape_tuple, value, axis):
     in the axis dimension and 'axis' is that dimension.  For this to work,
     axis has to be a const.
     """
-    if not isinstance(axis, types.Const):
-        raise RequireConstValue('axis argument must be a constant')
+    if not isinstance(axis, types.Literal):
+        raise RequireLiteralValue('axis argument must be a constant')
     # Get the value of the axis constant.
-    axis_value = axis.value
+    axis_value = axis.literal_value
     # The length of the indexing tuple to be output.
     nd = len(shape_tuple)
 
@@ -167,9 +168,9 @@ def array_sum(context, builder, sig, args):
     return impl_ret_borrowed(context, builder, sig.return_type, res)
 
 @lower_builtin(np.sum, types.Array, types.intp)
-@lower_builtin(np.sum, types.Array, types.Const)
+@lower_builtin(np.sum, types.Array, types.IntegerLiteral)
 @lower_builtin("array.sum", types.Array, types.intp)
-@lower_builtin("array.sum", types.Array, types.Const)
+@lower_builtin("array.sum", types.Array, types.IntegerLiteral)
 def array_sum_axis(context, builder, sig, args):
     """
     The third parameter to gen_index_tuple that generates the indexing
@@ -185,9 +186,9 @@ def array_sum_axis(context, builder, sig, args):
     [ty_array, ty_axis] = sig.args
     is_axis_const = False
     const_axis_val = 0
-    if isinstance(ty_axis, types.Const):
+    if isinstance(ty_axis, types.Literal):
         # this special-cases for constant axis
-        const_axis_val = ty_axis.value
+        const_axis_val = ty_axis.literal_value
         # fix negative axis
         if const_axis_val < 0:
             const_axis_val = ty_array.ndim + const_axis_val
@@ -278,10 +279,7 @@ def array_cumsum(context, builder, sig, args):
     zero = scalar_dtype(0)
 
     def array_cumsum_impl(arr):
-        size = 1
-        for i in arr.shape:
-            size = size * i
-        out = np.empty(size, dtype)
+        out = np.empty(arr.size, dtype)
         c = zero
         for idx, v in enumerate(arr.flat):
             c += v
@@ -292,8 +290,6 @@ def array_cumsum(context, builder, sig, args):
                                    locals=dict(c=scalar_dtype))
     return impl_ret_new_ref(context, builder, sig.return_type, res)
 
-
-
 @lower_builtin(np.cumprod, types.Array)
 @lower_builtin("array.cumprod", types.Array)
 def array_cumprod(context, builder, sig, args):
@@ -301,10 +297,7 @@ def array_cumprod(context, builder, sig, args):
     dtype = as_dtype(scalar_dtype)
 
     def array_cumprod_impl(arr):
-        size = 1
-        for i in arr.shape:
-            size = size * i
-        out = np.empty(size, dtype)
+        out = np.empty(arr.size, dtype)
         c = 1
         for idx, v in enumerate(arr.flat):
             c *= v
@@ -359,16 +352,27 @@ def array_std(context, builder, sig, args):
     return impl_ret_untracked(context, builder, sig.return_type, res)
 
 
+def zero_dim_msg(fn_name):
+    msg = ("zero-size array to reduction operation "
+           "{0} which has no identity".format(fn_name))
+    return msg
+
+
 @lower_builtin(np.min, types.Array)
 @lower_builtin("array.min", types.Array)
 def array_min(context, builder, sig, args):
     ty = sig.args[0].dtype
+    MSG = zero_dim_msg('minimum')
+
     if isinstance(ty, (types.NPDatetime, types.NPTimedelta)):
         # NaT is smaller than every other value, but it is
         # ignored as far as min() is concerned.
         nat = ty('NaT')
 
         def array_min_impl(arry):
+            if arry.size == 0:
+                raise ValueError(MSG)
+
             min_value = nat
             it = np.nditer(arry)
             for view in it:
@@ -383,18 +387,37 @@ def array_min(context, builder, sig, args):
                     min_value = v
             return min_value
 
+    elif isinstance(ty, types.Complex):
+        def array_min_impl(arry):
+            if arry.size == 0:
+                raise ValueError(MSG)
+
+            it = np.nditer(arry)
+            min_value = next(it).take(0)
+
+            for view in it:
+                v = view.item()
+                if v.real < min_value.real:
+                    min_value = v
+                elif v.real == min_value.real:
+                    if v.imag < min_value.imag:
+                        min_value = v
+            return min_value
+
     else:
         def array_min_impl(arry):
+            if arry.size == 0:
+                raise ValueError(MSG)
+
             it = np.nditer(arry)
-            for view in it:
-                min_value = view.item()
-                break
+            min_value = next(it).take(0)
 
             for view in it:
                 v = view.item()
                 if v < min_value:
                     min_value = v
             return min_value
+
     res = context.compile_internal(builder, array_min_impl, sig, args)
     return impl_ret_borrowed(context, builder, sig.return_type, res)
 
@@ -402,17 +425,39 @@ def array_min(context, builder, sig, args):
 @lower_builtin(np.max, types.Array)
 @lower_builtin("array.max", types.Array)
 def array_max(context, builder, sig, args):
-    def array_max_impl(arry):
-        it = np.nditer(arry)
-        for view in it:
-            max_value = view.item()
-            break
+    ty = sig.args[0].dtype
+    MSG = zero_dim_msg('maximum')
 
-        for view in it:
-            v = view.item()
-            if v > max_value:
-                max_value = v
-        return max_value
+    if isinstance(ty, types.Complex):
+        def array_max_impl(arry):
+            if arry.size == 0:
+                raise ValueError(MSG)
+
+            it = np.nditer(arry)
+            max_value = next(it).take(0)
+
+            for view in it:
+                v = view.item()
+                if v.real > max_value.real:
+                    max_value = v
+                elif v.real == max_value.real:
+                    if v.imag > max_value.imag:
+                        max_value = v
+            return max_value
+    else:
+        def array_max_impl(arry):
+            if arry.size == 0:
+                raise ValueError(MSG)
+
+            it = np.nditer(arry)
+            max_value = next(it).take(0)
+
+            for view in it:
+                v = view.item()
+                if v > max_value:
+                    max_value = v
+            return max_value
+
     res = context.compile_internal(builder, array_max_impl, sig, args)
     return impl_ret_borrowed(context, builder, sig.return_type, res)
 
@@ -431,6 +476,8 @@ def array_argmin(context, builder, sig, args):
         nat = ty('NaT')
 
         def array_argmin_impl(arry):
+            if arry.size == 0:
+                raise ValueError("attempt to get argmin of an empty sequence")
             min_value = nat
             min_idx = 0
             it = arry.flat
@@ -452,6 +499,8 @@ def array_argmin(context, builder, sig, args):
 
     else:
         def array_argmin_impl(arry):
+            if arry.size == 0:
+                raise ValueError("attempt to get argmin of an empty sequence")
             for v in arry.flat:
                 min_value = v
                 min_idx = 0
@@ -472,6 +521,8 @@ def array_argmin(context, builder, sig, args):
 @lower_builtin("array.argmax", types.Array)
 def array_argmax(context, builder, sig, args):
     def array_argmax_impl(arry):
+        if arry.size == 0:
+            raise ValueError("attempt to get argmax of an empty sequence")
         for v in arry.flat:
             max_value = v
             max_idx = 0
@@ -523,46 +574,81 @@ def get_isnan(dtype):
             return False
         return _trivial_isnan
 
+@register_jitable
+def less_than(a, b):
+    return a < b
+
+@register_jitable
+def greater_than(a, b):
+    return a > b
+
+@register_jitable
+def check_array(a):
+    if a.size == 0:
+        raise ValueError('zero-size array to reduction operation not possible')
+
+def nan_min_max_factory(comparison_op, is_complex_dtype):
+
+    if is_complex_dtype:
+        def impl(a):
+            arr = np.asarray(a)
+            check_array(arr)
+            it = np.nditer(arr)
+            return_val = next(it).take(0)
+            for view in it:
+                v = view.item()
+                if np.isnan(return_val.real) and not np.isnan(v.real):
+                    return_val = v
+                else:
+                    if comparison_op(v.real, return_val.real):
+                        return_val = v
+                    elif v.real == return_val.real:
+                        if comparison_op(v.imag, return_val.imag):
+                            return_val = v
+            return return_val
+    else:
+        def impl(a):
+            arr = np.asarray(a)
+            check_array(arr)
+            it = np.nditer(arr)
+            return_val = next(it).take(0)
+            for view in it:
+                v = view.item()
+                if not np.isnan(v):
+                    if not comparison_op(return_val, v):
+                        return_val = v
+            return return_val
+
+    return impl
+
+real_nanmin = register_jitable(
+    nan_min_max_factory(less_than, is_complex_dtype=False)
+)
+real_nanmax = register_jitable(
+    nan_min_max_factory(greater_than, is_complex_dtype=False)
+)
+complex_nanmin = register_jitable(
+    nan_min_max_factory(less_than, is_complex_dtype=True)
+)
+complex_nanmax = register_jitable(
+    nan_min_max_factory(greater_than, is_complex_dtype=True)
+)
 
 @overload(np.nanmin)
 def np_nanmin(a):
-    if not isinstance(a, types.Array):
-        return
-    isnan = get_isnan(a.dtype)
-
-    def nanmin_impl(a):
-        if a.size == 0:
-            raise ValueError("nanmin(): empty array")
-        for view in np.nditer(a):
-            minval = view.item()
-            break
-        for view in np.nditer(a):
-            v = view.item()
-            if not minval < v and not isnan(v):
-                minval = v
-        return minval
-
-    return nanmin_impl
+    dt = determine_dtype(a)
+    if np.issubdtype(dt, np.complexfloating):
+        return complex_nanmin
+    else:
+        return real_nanmin
 
 @overload(np.nanmax)
 def np_nanmax(a):
-    if not isinstance(a, types.Array):
-        return
-    isnan = get_isnan(a.dtype)
-
-    def nanmax_impl(a):
-        if a.size == 0:
-            raise ValueError("nanmin(): empty array")
-        for view in np.nditer(a):
-            maxval = view.item()
-            break
-        for view in np.nditer(a):
-            v = view.item()
-            if not maxval > v and not isnan(v):
-                maxval = v
-        return maxval
-
-    return nanmax_impl
+    dt = determine_dtype(a)
+    if np.issubdtype(dt, np.complexfloating):
+        return complex_nanmax
+    else:
+        return real_nanmax
 
 if numpy_version >= (1, 8):
     @overload(np.nanmean)
@@ -571,10 +657,10 @@ if numpy_version >= (1, 8):
             return
         isnan = get_isnan(a.dtype)
 
-        def nanmean_impl(arr):
+        def nanmean_impl(a):
             c = 0.0
             count = 0
-            for view in np.nditer(arr):
+            for view in np.nditer(a):
                 v = view.item()
                 if not isnan(v):
                     c += v.item()
@@ -590,14 +676,14 @@ if numpy_version >= (1, 8):
             return
         isnan = get_isnan(a.dtype)
 
-        def nanvar_impl(arr):
+        def nanvar_impl(a):
             # Compute the mean
-            m = np.nanmean(arr)
+            m = np.nanmean(a)
 
             # Compute the sum of square diffs
             ssd = 0.0
             count = 0
-            for view in np.nditer(arr):
+            for view in np.nditer(a):
                 v = view.item()
                 if not isnan(v):
                     val = (v.item() - m)
@@ -613,8 +699,8 @@ if numpy_version >= (1, 8):
         if not isinstance(a, types.Array):
             return
 
-        def nanstd_impl(arr):
-            return np.nanvar(arr) ** 0.5
+        def nanstd_impl(a):
+            return np.nanvar(a) ** 0.5
 
         return nanstd_impl
 
@@ -629,9 +715,9 @@ def np_nansum(a):
     zero = retty(0)
     isnan = get_isnan(a.dtype)
 
-    def nansum_impl(arr):
+    def nansum_impl(a):
         c = zero
-        for view in np.nditer(arr):
+        for view in np.nditer(a):
             v = view.item()
             if not isnan(v):
                 c += v
@@ -651,9 +737,9 @@ if numpy_version >= (1, 10):
         one = retty(1)
         isnan = get_isnan(a.dtype)
 
-        def nanprod_impl(arr):
+        def nanprod_impl(a):
             c = one
-            for view in np.nditer(arr):
+            for view in np.nditer(a):
                 v = view.item()
                 if not isnan(v):
                     c *= v
@@ -661,58 +747,207 @@ if numpy_version >= (1, 10):
 
         return nanprod_impl
 
+if numpy_version >= (1, 12):
+    @overload(np.nancumprod)
+    def np_nancumprod(a):
+        if not isinstance(a, types.Array):
+            return
+
+        if isinstance(a.dtype, (types.Boolean, types.Integer)):
+            # dtype cannot possibly contain NaN
+            return lambda a: np.cumprod(a)
+        else:
+            retty = a.dtype
+            is_nan = get_isnan(retty)
+            one = retty(1)
+
+            def nancumprod_impl(a):
+                out = np.empty(a.size, retty)
+                c = one
+                for idx, v in enumerate(a.flat):
+                    if ~is_nan(v):
+                        c *= v
+                    out[idx] = c
+                return out
+
+            return nancumprod_impl
+
+    @overload(np.nancumsum)
+    def np_nancumsum(a):
+        if not isinstance(a, types.Array):
+            return
+
+        if isinstance(a.dtype, (types.Boolean, types.Integer)):
+            # dtype cannot possibly contain NaN
+            return lambda a: np.cumsum(a)
+        else:
+            retty = a.dtype
+            is_nan = get_isnan(retty)
+            zero = retty(0)
+
+            def nancumsum_impl(a):
+                out = np.empty(a.size, retty)
+                c = zero
+                for idx, v in enumerate(a.flat):
+                    if ~is_nan(v):
+                        c += v
+                    out[idx] = c
+                return out
+
+            return nancumsum_impl
+
+@register_jitable
+def prepare_ptp_input(a):
+    arr = _asarray(a)
+    if len(arr) == 0:
+        raise ValueError('zero-size array reduction not possible')
+    else:
+        return arr
+
+def _compute_current_val_impl_gen(op):
+    def _compute_current_val_impl(current_val, val):
+        if isinstance(current_val, types.Complex):
+            # The sort order for complex numbers is lexicographic. If both the
+            # real and imaginary parts are non-nan then the order is determined
+            # by the real parts except when they are equal, in which case the
+            # order is determined by the imaginary parts.
+            # https://github.com/numpy/numpy/blob/577a86e/numpy/core/fromnumeric.py#L874-L877
+            def impl(current_val, val):
+                if op(val.real, current_val.real):
+                    return val
+                elif (val.real == current_val.real
+                    and op(val.imag, current_val.imag)):
+                    return val
+                return current_val
+        else:
+            def impl(current_val, val):
+                return val if op(val, current_val) else current_val
+        return impl
+    return _compute_current_val_impl
+
+_compute_a_max = generated_jit(_compute_current_val_impl_gen(greater_than))
+_compute_a_min = generated_jit(_compute_current_val_impl_gen(less_than))
+
+@generated_jit
+def _early_return(val):
+    UNUSED = 0
+    if isinstance(val, types.Complex):
+        def impl(val):
+            if np.isnan(val.real):
+                if np.isnan(val.imag):
+                    return True, np.nan + np.nan * 1j
+                else:
+                    return True, np.nan + 0j
+            else:
+                return False, UNUSED
+    elif isinstance(val, types.Float):
+        def impl(val):
+            if np.isnan(val):
+                return True, np.nan
+            else:
+                return False, UNUSED
+    else:
+        def impl(val):
+            return False, UNUSED
+    return impl
+
+@overload(np.ptp)
+def np_ptp(a):
+
+    if hasattr(a, 'dtype'):
+        if isinstance(a.dtype, types.Boolean):
+            raise TypingError("Boolean dtype is unsupported (as per NumPy)")
+            # Numpy raises a TypeError
+
+    def np_ptp_impl(a):
+        arr = prepare_ptp_input(a)
+
+        a_flat = arr.flat
+        a_min = a_flat[0]
+        a_max = a_flat[0]
+
+        for i in range(arr.size):
+            val = a_flat[i]
+            take_branch, retval = _early_return(val)
+            if take_branch:
+                return retval
+            a_max = _compute_a_max(a_max, val)
+            a_min = _compute_a_min(a_min, val)
+
+        return a_max - a_min
+
+    return np_ptp_impl
+
 #----------------------------------------------------------------------------
 # Median and partitioning
 
 @register_jitable
-def _partition(A, low, high):
-    mid = (low + high) >> 1
-    # NOTE: the pattern of swaps below for the pivot choice and the
-    # partitioning gives good results (i.e. regular O(n log n))
-    # on sorted, reverse-sorted, and uniform arrays.  Subtle changes
-    # risk breaking this property.
-
-    # Use median of three {low, middle, high} as the pivot
-    if A[mid] < A[low]:
-        A[low], A[mid] = A[mid], A[low]
-    if A[high] < A[mid]:
-        A[high], A[mid] = A[mid], A[high]
-    if A[mid] < A[low]:
-        A[low], A[mid] = A[mid], A[low]
-    pivot = A[mid]
-
-    A[high], A[mid] = A[mid], A[high]
-    i = low
-    j = high - 1
-    while True:
-        while i < high and A[i] < pivot:
-            i += 1
-        while j >= low and pivot < A[j]:
-            j -= 1
-        if i >= j:
-            break
-        A[i], A[j] = A[j], A[i]
-        i += 1
-        j -= 1
-    # Put the pivot back in its final place (all items before `i`
-    # are smaller than the pivot, all items at/after `i` are larger)
-    A[i], A[high] = A[high], A[i]
-    return i
-
-@register_jitable
-def _select(arry, k, low, high):
-    """
-    Select the k'th smallest element in array[low:high + 1].
-    """
-    i = _partition(arry, low, high)
-    while i != k:
-        if i < k:
-            low = i + 1
-            i = _partition(arry, low, high)
+def nan_aware_less_than(a, b):
+    if np.isnan(a):
+        return False
+    else:
+        if np.isnan(b):
+            return True
         else:
-            high = i - 1
-            i = _partition(arry, low, high)
-    return arry[k]
+            return a < b
+
+def _partition_factory(pivotimpl):
+    def _partition(A, low, high):
+        mid = (low + high) >> 1
+        # NOTE: the pattern of swaps below for the pivot choice and the
+        # partitioning gives good results (i.e. regular O(n log n))
+        # on sorted, reverse-sorted, and uniform arrays.  Subtle changes
+        # risk breaking this property.
+
+        # Use median of three {low, middle, high} as the pivot
+        if pivotimpl(A[mid], A[low]):
+            A[low], A[mid] = A[mid], A[low]
+        if pivotimpl(A[high], A[mid]):
+            A[high], A[mid] = A[mid], A[high]
+        if pivotimpl(A[mid], A[low]):
+            A[low], A[mid] = A[mid], A[low]
+        pivot = A[mid]
+
+        A[high], A[mid] = A[mid], A[high]
+        i = low
+        j = high - 1
+        while True:
+            while i < high and pivotimpl(A[i], pivot):
+                i += 1
+            while j >= low and pivotimpl(pivot, A[j]):
+                j -= 1
+            if i >= j:
+                break
+            A[i], A[j] = A[j], A[i]
+            i += 1
+            j -= 1
+        # Put the pivot back in its final place (all items before `i`
+        # are smaller than the pivot, all items at/after `i` are larger)
+        A[i], A[high] = A[high], A[i]
+        return i
+    return _partition
+
+_partition = register_jitable(_partition_factory(less_than))
+_partition_w_nan = register_jitable(_partition_factory(nan_aware_less_than))
+
+def _select_factory(partitionimpl):
+    def _select(arry, k, low, high):
+        """
+        Select the k'th smallest element in array[low:high + 1].
+        """
+        i = partitionimpl(arry, low, high)
+        while i != k:
+            if i < k:
+                low = i + 1
+                i = partitionimpl(arry, low, high)
+            else:
+                high = i - 1
+                i = partitionimpl(arry, low, high)
+        return arry[k]
+    return _select
+
+_select = register_jitable(_select_factory(_partition))
+_select_w_nan = register_jitable(_select_factory(_partition_w_nan))
 
 @register_jitable
 def _select_two(arry, k, low, high):
@@ -758,10 +993,10 @@ def np_median(a):
     if not isinstance(a, types.Array):
         return
 
-    def median_impl(arry):
+    def median_impl(a):
         # np.median() works on the flattened array, and we need a temporary
         # workspace anyway
-        temp_arry = arry.flatten()
+        temp_arry = a.flatten()
         n = temp_arry.shape[0]
         return _median_inner(temp_arry, n)
 
@@ -893,11 +1128,11 @@ if numpy_version >= (1, 9):
             return
         isnan = get_isnan(a.dtype)
 
-        def nanmedian_impl(arry):
+        def nanmedian_impl(a):
             # Create a temporary workspace with only non-NaN values
-            temp_arry = np.empty(arry.size, arry.dtype)
+            temp_arry = np.empty(a.size, a.dtype)
             n = 0
-            for view in np.nditer(arry):
+            for view in np.nditer(a):
                 v = view.item()
                 if not isnan(v):
                     temp_arry[n] = v
@@ -911,8 +1146,844 @@ if numpy_version >= (1, 9):
 
         return nanmedian_impl
 
+@register_jitable
+def np_partition_impl_inner(a, kth_array):
+
+    # allocate and fill empty array rather than copy a and mutate in place
+    # as the latter approach fails to preserve strides
+    out = np.empty_like(a)
+
+    idx = np.ndindex(a.shape[:-1])  # Numpy default partition axis is -1
+    for s in idx:
+        arry = a[s].copy()
+        low = 0
+        high = len(arry) - 1
+
+        for kth in kth_array:
+            _select_w_nan(arry, kth, low, high)
+            low = kth  # narrow span of subsequent partition
+
+        out[s] = arry
+    return out
+
+@register_jitable
+def valid_kths(a, kth):
+    """
+    Returns a sorted, unique array of kth values which serve
+    as indexers for partitioning the input array, a.
+
+    If the absolute value of any of the provided values
+    is greater than a.shape[-1] an exception is raised since
+    we are partitioning along the last axis (per Numpy default
+    behaviour).
+
+    Values less than 0 are transformed to equivalent positive
+    index values.
+    """
+    kth_array = _asarray(kth).astype(np.int64)  # cast boolean to int, where relevant
+
+    if kth_array.ndim != 1:
+        raise ValueError('kth must be scalar or 1-D')
+        # numpy raises ValueError: object too deep for desired array
+
+    if np.any(np.abs(kth_array) >= a.shape[-1]):
+        raise ValueError("kth out of bounds")
+
+    out = np.empty_like(kth_array)
+
+    for index, val in np.ndenumerate(kth_array):
+        if val < 0:
+            out[index] = val + a.shape[-1]  # equivalent positive index
+        else:
+            out[index] = val
+
+    return np.unique(out)
+
+@overload(np.partition)
+def np_partition(a, kth):
+
+    if not isinstance(a, (types.Array, types.Sequence, types.Tuple)):
+        raise TypeError('The first argument must be an array-like')
+
+    if isinstance(a, types.Array) and a.ndim == 0:
+        raise TypeError('The first argument must be at least 1-D (found 0-D)')
+
+    kthdt = getattr(kth, 'dtype', kth)
+    if not isinstance(kthdt, (types.Boolean, types.Integer)):  # bool gets cast to int subsequently
+        raise TypeError('Partition index must be integer')
+
+    def np_partition_impl(a, kth):
+        a_tmp = _asarray(a)
+        if a_tmp.size == 0:
+            return a_tmp.copy()
+        else:
+            kth_array = valid_kths(a_tmp, kth)
+            return np_partition_impl_inner(a_tmp, kth_array)
+
+    return np_partition_impl
+
+#----------------------------------------------------------------------------
+# Building matrices
+
+@register_jitable
+def _tri_impl(N, M, k):
+    shape = max(0, N), max(0, M)  # numpy floors each dimension at 0
+    out = np.empty(shape, dtype=np.float64)  # numpy default dtype
+
+    for i in range(shape[0]):
+        m_max = min(max(0, i + k + 1), shape[1])
+        out[i, :m_max] = 1
+        out[i, m_max:] = 0
+
+    return out
+
+@overload(np.tri)
+def np_tri(N, M=None, k=0):
+
+    # we require k to be integer, unlike numpy
+    if not isinstance(k, (int, types.Integer)):
+        raise TypeError('k must be an integer')
+
+    def tri_impl(N, M=None, k=0):
+        if M is None:
+            M = N
+        return _tri_impl(N, M, k)
+
+    return tri_impl
+
+@register_jitable
+def _make_square(m):
+    """
+    Takes a 1d array and tiles it to form a square matrix
+    - i.e. a facsimile of np.tile(m, (len(m), 1))
+    """
+    assert m.ndim == 1
+
+    len_m = len(m)
+    out = np.empty((len_m, len_m), dtype=m.dtype)
+
+    for i in range(len_m):
+        out[i] = m
+
+    return out
+
+@register_jitable
+def np_tril_impl_2d(m, k=0):
+    mask = np.tri(m.shape[-2], M=m.shape[-1], k=k).astype(np.uint)
+    return np.where(mask, m, np.zeros_like(m, dtype=m.dtype))
+
+@overload(np.tril)
+def my_tril(m, k=0):
+
+    # we require k to be integer, unlike numpy
+    if not isinstance(k, (int, types.Integer)):
+        raise TypeError('k must be an integer')
+
+    def np_tril_impl_1d(m, k=0):
+        m_2d = _make_square(m)
+        return np_tril_impl_2d(m_2d, k)
+
+    def np_tril_impl_multi(m, k=0):
+        mask = np.tri(m.shape[-2], M=m.shape[-1], k=k).astype(np.uint)
+        idx = np.ndindex(m.shape[:-2])
+        z = np.empty_like(m)
+        zero_opt = np.zeros_like(mask, dtype=m.dtype)
+        for sel in idx:
+            z[sel] = np.where(mask, m[sel], zero_opt)
+        return z
+
+    if m.ndim == 1:
+        return np_tril_impl_1d
+    elif m.ndim == 2:
+        return np_tril_impl_2d
+    else:
+        return np_tril_impl_multi
+
+@register_jitable
+def np_triu_impl_2d(m, k=0):
+    mask = np.tri(m.shape[-2], M=m.shape[-1], k=k-1).astype(np.uint)
+    return np.where(mask, np.zeros_like(m, dtype=m.dtype), m)
+
+@overload(np.triu)
+def my_triu(m, k=0):
+
+    # we require k to be integer, unlike numpy
+    if not isinstance(k, (int, types.Integer)):
+        raise TypeError('k must be an integer')
+
+    def np_triu_impl_1d(m, k=0):
+        m_2d = _make_square(m)
+        return np_triu_impl_2d(m_2d, k)
+
+    def np_triu_impl_multi(m, k=0):
+        mask = np.tri(m.shape[-2], M=m.shape[-1], k=k-1).astype(np.uint)
+        idx = np.ndindex(m.shape[:-2])
+        z = np.empty_like(m)
+        zero_opt = np.zeros_like(mask, dtype=m.dtype)
+        for sel in idx:
+            z[sel] = np.where(mask, zero_opt, m[sel])
+        return z
+
+    if m.ndim == 1:
+        return np_triu_impl_1d
+    elif m.ndim == 2:
+        return np_triu_impl_2d
+    else:
+        return np_triu_impl_multi
+
+def _prepare_array(arr):
+    pass
+
+@overload(_prepare_array)
+def _prepare_array_impl(arr):
+    if arr in (None, types.none):
+        return lambda arr: np.array(())
+    else:
+        return lambda arr: _asarray(arr).ravel()
+
+if numpy_version >= (1, 12):  # replicate behaviour of NumPy 1.12 bugfix release
+    @overload(np.ediff1d)
+    def np_ediff1d(ary, to_end=None, to_begin=None):
+
+        if isinstance(ary, types.Array):
+            if isinstance(ary.dtype, types.Boolean):
+                raise TypeError("Boolean dtype is unsupported (as per NumPy)")
+                # Numpy tries to do this: return ary[1:] - ary[:-1] which results in a
+                # TypeError exception being raised
+
+        def np_ediff1d_impl(ary, to_end=None, to_begin=None):
+            # transform each input into an equivalent 1d array
+            start = _prepare_array(to_begin)
+            mid = _prepare_array(ary)
+            end = _prepare_array(to_end)
+
+            out_dtype = mid.dtype
+            # output array dtype determined by ary dtype, per NumPy (for the most part);
+            # an exception to the rule is a zero length array-like, where NumPy falls back
+            # to np.float64; this behaviour is *not* replicated
+
+            if len(mid) > 0:
+                out = np.empty((len(start) + len(mid) + len(end) - 1), dtype=out_dtype)
+                start_idx = len(start)
+                mid_idx = len(start) + len(mid) - 1
+                out[:start_idx] = start
+                out[start_idx:mid_idx] = np.diff(mid)
+                out[mid_idx:] = end
+            else:
+                out = np.empty((len(start) + len(end)), dtype=out_dtype)
+                start_idx = len(start)
+                out[:start_idx] = start
+                out[start_idx:] = end
+            return out
+
+        return np_ediff1d_impl
+
+def _select_element(arr):
+    pass
+
+@overload(_select_element)
+def _select_element_impl(arr):
+    zerod = getattr(arr, 'ndim', None) == 0
+    if zerod:
+        def impl(arr):
+            x = np.array((1,), dtype=arr.dtype)
+            x[:] = arr
+            return x[0]
+        return impl
+    else:
+        def impl(arr):
+            return arr
+        return impl
+
+def _get_d(dx, x):
+    pass
+
+@overload(_get_d)
+def get_d_impl(x, dx):
+    if _is_nonelike(x):
+        def impl(x, dx):
+            return np.asarray(dx)
+    else:
+        def impl(x, dx):
+            return np.diff(np.asarray(x))
+    return impl
+
+@overload(np.trapz)
+def np_trapz(y, x=None, dx=1.0):
+
+    if isinstance(y, (types.Number, types.Boolean)):
+        raise TypingError('y cannot be a scalar')
+    elif isinstance(y, types.Array) and y.ndim == 0:
+        raise TypingError('y cannot be 0D')
+        # NumPy raises IndexError: list assignment index out of range
+
+    # inspired by:
+    # https://github.com/numpy/numpy/blob/7ee52003/numpy/lib/function_base.py#L4040-L4065
+    def impl(y, x=None, dx=1.0):
+        yarr = np.asarray(y)
+        d = _get_d(x, dx)
+        y_ave = (yarr[..., slice(1, None)] + yarr[..., slice(None, -1)]) / 2.0
+        ret = np.sum(d * y_ave, -1)
+        processed = _select_element(ret)
+        return processed
+
+    return impl
+
+@register_jitable
+def _np_vander(x, N, increasing, out):
+    """
+    Generate an N-column Vandermonde matrix from a supplied 1-dimensional
+    array, x. Store results in an output matrix, out, which is assumed to
+    be of the required dtype.
+
+    Values are accumulated using np.multiply to match the floating point
+    precision behaviour of numpy.vander.
+    """
+    m, n = out.shape
+    assert m == len(x)
+    assert n == N
+
+    if increasing:
+        for i in range(N):
+            if i == 0:
+                out[:, i] = 1
+            else:
+                out[:, i] = np.multiply(x, out[:, (i - 1)])
+    else:
+        for i in range(N - 1, -1, -1):
+            if i == N - 1:
+                out[:, i] = 1
+            else:
+                out[:, i] = np.multiply(x, out[:, (i + 1)])
+
+@register_jitable
+def _check_vander_params(x, N):
+    if x.ndim > 1:
+        raise ValueError('x must be a one-dimensional array or sequence.')
+    if N < 0:
+        raise ValueError('Negative dimensions are not allowed')
+
+@overload(np.vander)
+def np_vander(x, N=None, increasing=False):
+
+    if N not in (None, types.none):
+        if not isinstance(N, types.Integer):
+            raise TypingError('Second argument N must be None or an integer')
+
+    def np_vander_impl(x, N=None, increasing=False):
+        if N is None:
+            N = len(x)
+
+        _check_vander_params(x, N)
+
+        # allocate output matrix using dtype determined in closure
+        out = np.empty((len(x), int(N)), dtype=dtype)
+
+        _np_vander(x, N, increasing, out)
+        return out
+
+    def np_vander_seq_impl(x, N=None, increasing=False):
+        if N is None:
+            N = len(x)
+
+        x_arr = np.array(x)
+        _check_vander_params(x_arr, N)
+
+        # allocate output matrix using dtype inferred when x_arr was created
+        out = np.empty((len(x), int(N)), dtype=x_arr.dtype)
+
+        _np_vander(x_arr, N, increasing, out)
+        return out
+
+    if isinstance(x, types.Array):
+        x_dt = as_dtype(x.dtype)
+        dtype = np.promote_types(x_dt, int)  # replicate numpy behaviour w.r.t. type promotion
+        return np_vander_impl
+    elif isinstance(x, (types.Tuple, types.Sequence)):
+        return np_vander_seq_impl
+
+@overload(np.roll)
+def np_roll(a, shift):
+
+    if not isinstance(shift, (types.Integer, types.Boolean)):
+        raise TypingError('shift must be an integer')
+
+    def np_roll_impl(a, shift):
+        arr = np.asarray(a)
+        out = np.empty(arr.shape, dtype=arr.dtype)
+        # empty_like might result in different contiguity vs NumPy
+
+        arr_flat = arr.flat
+        for i in range(arr.size):
+            idx = (i + shift) % arr.size
+            out.flat[idx] = arr_flat[i]
+
+        return out
+
+    if isinstance(a, (types.Number, types.Boolean)):
+        return lambda a, shift: np.asarray(a)
+    else:
+        return np_roll_impl
+
+#----------------------------------------------------------------------------
+# Mathematical functions
+
+@register_jitable
+def np_interp_impl_inner(x, xp, fp, dtype):
+    x_arr = np.asarray(x)
+    xp_arr = np.asarray(xp)
+    fp_arr = np.asarray(fp)
+
+    if len(xp_arr) == 0:
+        raise ValueError('array of sample points is empty')
+
+    if len(xp_arr) != len(fp_arr):
+        raise ValueError('fp and xp are not of the same size.')
+
+    if xp_arr.size > 1 and not np.all(np.diff(xp_arr) > 0):
+        msg = 'xp must be monotonically increasing'
+        raise ValueError(msg)
+        # note: NumPy docs suggest this is required but it is not
+        # checked for or enforced
+
+    if xp_arr.size == 1:
+        return np.full(x_arr.shape, fill_value=fp_arr[0], dtype=dtype)
+    else:
+        out = np.empty(x_arr.shape, dtype=dtype)
+
+        # pre-cache slopes
+        slopes = (fp_arr[1:] - fp_arr[:-1]) / (xp_arr[1:] - xp_arr[:-1])
+
+        last_idx = 0
+
+        for i in range(x_arr.size):
+            if x_arr.flat[i] >= xp_arr[-1]:
+                out.flat[i] = fp_arr[-1]
+                last_idx = -1
+            elif x_arr.flat[i] <= xp_arr[0]:
+                out.flat[i] = fp_arr[0]
+                last_idx = 0
+            else:
+                if i == 0:
+                    idx = np.searchsorted(xp_arr[1:-1], x_arr.flat[i])
+                else:
+                    if x_arr.flat[i] > x_arr.flat[i - 1]:
+                        idx = np.searchsorted(xp_arr[last_idx - 1:-1],
+                                              x_arr.flat[i])
+                    elif x_arr.flat[i] == x_arr.flat[i - 1]:
+                        idx = last_idx
+                    else:
+                        idx = np.searchsorted(xp_arr[1:last_idx], x_arr.flat[i])
+
+                if x_arr.flat[i] == xp_arr[idx]:
+                    out.flat[i] = fp_arr[idx]
+                else:
+                    delta_x = x_arr.flat[i] - xp_arr[idx - 1]
+                    out.flat[i] = fp_arr[idx - 1] + slopes[idx - 1] * delta_x
+
+                # reduce subsequent search space
+                last_idx = idx
+
+        return out
+
+if numpy_version >= (1, 10):
+    # replicate behaviour change of 1.10+
+    @overload(np.interp)
+    def np_interp(x, xp, fp):
+
+        if hasattr(xp, 'ndim') and xp.ndim > 1:
+            raise TypingError('xp must be 1D')
+        if hasattr(fp, 'ndim') and fp.ndim > 1:
+            raise TypingError('fp must be 1D')
+
+        complex_dtype_msg = (
+            "Cannot cast array data from complex dtype to float64 dtype"
+        )
+
+        xp_dt = determine_dtype(xp)
+        if np.issubdtype(xp_dt, np.complexfloating):
+            raise TypingError(complex_dtype_msg)
+
+        fp_dt = determine_dtype(fp)
+        dtype = np.result_type(fp_dt, np.float64)
+
+        def np_interp_impl(x, xp, fp):
+            return np_interp_impl_inner(x, xp, fp, dtype)
+
+        def np_interp_scalar_impl(x, xp, fp):
+            return np_interp_impl_inner(x, xp, fp, dtype).flat[0]
+
+        if isinstance(x, types.Number):
+            if isinstance(x, types.Complex):
+                raise TypingError(complex_dtype_msg)
+            return np_interp_scalar_impl
+
+        return np_interp_impl
+
+#----------------------------------------------------------------------------
+# Statistics
+
+@register_jitable
+def row_wise_average(a):
+    assert a.ndim == 2
+
+    m, n = a.shape
+    out = np.empty((m, 1), dtype=a.dtype)
+
+    for i in range(m):
+        out[i, 0] = np.sum(a[i, :]) / n
+
+    return out
+
+@register_jitable
+def np_cov_impl_inner(X, bias, ddof):
+
+    # determine degrees of freedom
+    if ddof is None:
+        if bias:
+            ddof = 0
+        else:
+            ddof = 1
+
+    # determine the normalization factor
+    fact = X.shape[1] - ddof
+
+    # numpy warns if less than 0 and floors at 0
+    fact = max(fact, 0.0)
+
+    # de-mean
+    X -= row_wise_average(X)
+
+    # calculate result - requires blas
+    c = np.dot(X, np.conj(X.T))
+    c *= np.true_divide(1, fact)
+    return c
+
+def _prepare_cov_input_inner():
+    pass
+
+@overload(_prepare_cov_input_inner)
+def _prepare_cov_input_impl(m, y, rowvar, dtype):
+    if y in (None, types.none):
+        def _prepare_cov_input_inner(m, y, rowvar, dtype):
+            m_arr = np.atleast_2d(_asarray(m))
+
+            if not rowvar:
+                m_arr = m_arr.T
+
+            return m_arr
+    else:
+        def _prepare_cov_input_inner(m, y, rowvar, dtype):
+            m_arr = np.atleast_2d(_asarray(m))
+            y_arr = np.atleast_2d(_asarray(y))
+
+            # transpose if asked to and not a (1, n) vector - this looks
+            # wrong as you might end up transposing one and not the other,
+            # but it's what numpy does
+            if not rowvar:
+                if m_arr.shape[0] != 1:
+                    m_arr = m_arr.T
+                if y_arr.shape[0] != 1:
+                    y_arr = y_arr.T
+
+            m_rows, m_cols = m_arr.shape
+            y_rows, y_cols = y_arr.shape
+
+            if m_cols != y_cols:
+                raise ValueError("m and y have incompatible dimensions")
+
+            # allocate and fill output array
+            out = np.empty((m_rows + y_rows, m_cols), dtype=dtype)
+            out[:m_rows, :] = m_arr
+            out[-y_rows:, :] = y_arr
+
+            return out
+
+    return _prepare_cov_input_inner
+
+@register_jitable
+def _handle_m_dim_change(m):
+    if m.ndim == 2 and m.shape[0] == 1:
+        msg = ("2D array containing a single row is unsupported due to "
+               "ambiguity in type inference. To use numpy.cov in this case "
+               "simply pass the row as a 1D array, i.e. m[0].")
+        raise RuntimeError(msg)
+
+_handle_m_dim_nop = register_jitable(lambda x: x)
+
+def determine_dtype(array_like):
+    array_like_dt = np.float64
+    if isinstance(array_like, types.Array):
+        array_like_dt = as_dtype(array_like.dtype)
+    elif isinstance(array_like, (types.Number, types.Boolean)):
+        array_like_dt = as_dtype(array_like)
+    elif isinstance(array_like, (types.UniTuple, types.Tuple)):
+        coltypes = set()
+        for val in array_like:
+            if hasattr(val, 'count'):
+                [coltypes.add(v) for v in val]
+            else:
+                coltypes.add(val)
+        if len(coltypes) > 1:
+            array_like_dt = np.promote_types(*[as_dtype(ty) for ty in coltypes])
+        elif len(coltypes) == 1:
+            array_like_dt = as_dtype(coltypes.pop())
+
+    return array_like_dt
+
+def check_dimensions(array_like, name):
+    if isinstance(array_like, types.Array):
+        if array_like.ndim > 2:
+            raise TypeError("{0} has more than 2 dimensions".format(name))
+    elif isinstance(array_like, types.Sequence):
+        if isinstance(array_like.key[0], types.Sequence):
+            if isinstance(array_like.key[0].key[0], types.Sequence):
+                raise TypeError("{0} has more than 2 dimensions".format(name))
+
+@register_jitable
+def _handle_ddof(ddof):
+    if not np.isfinite(ddof):
+        raise ValueError('Cannot convert non-finite ddof to integer')
+    if ddof - int(ddof) != 0:
+        raise ValueError('ddof must be integral value')
+
+_handle_ddof_nop = register_jitable(lambda x: x)
+
+@register_jitable
+def _prepare_cov_input(m, y, rowvar, dtype, ddof, _DDOF_HANDLER, _M_DIM_HANDLER):
+    _M_DIM_HANDLER(m)
+    _DDOF_HANDLER(ddof)
+    return _prepare_cov_input_inner(m, y, rowvar, dtype)
+
+def scalar_result_expected(mandatory_input, optional_input):
+    opt_is_none = optional_input in (None, types.none)
+
+    if isinstance(mandatory_input, types.Array) and mandatory_input.ndim == 1:
+        return opt_is_none
+
+    if isinstance(mandatory_input, types.BaseTuple):
+        if all(isinstance(x, (types.Number, types.Boolean)) for x in mandatory_input.types):
+            return opt_is_none
+        else:
+            if len(mandatory_input.types) == 1 and isinstance(mandatory_input.types[0], types.BaseTuple):
+                return opt_is_none
+
+    if isinstance(mandatory_input, (types.Number, types.Boolean)):
+        return opt_is_none
+
+    if isinstance(mandatory_input, types.Sequence):
+        if not isinstance(mandatory_input.key[0], types.Sequence) and opt_is_none:
+            return True
+
+    return False
+
+@register_jitable
+def _clip_corr(x):
+    return np.where(np.fabs(x) > 1, np.sign(x), x)
+
+@register_jitable
+def _clip_complex(x):
+    real = _clip_corr(x.real)
+    imag = _clip_corr(x.imag)
+    return real + 1j * imag
+
+if numpy_version >= (1, 10):  # replicate behaviour post numpy 1.10 bugfix release
+    @overload(np.cov)
+    def np_cov(m, y=None, rowvar=True, bias=False, ddof=None):
+
+        # reject problem if m and / or y are more than 2D
+        check_dimensions(m, 'm')
+        check_dimensions(y, 'y')
+
+        # reject problem if ddof invalid (either upfront if type is
+        # obviously invalid, or later if value found to be non-integral)
+        if ddof in (None, types.none):
+            _DDOF_HANDLER = _handle_ddof_nop
+        else:
+            if isinstance(ddof, (types.Integer, types.Boolean)):
+                _DDOF_HANDLER = _handle_ddof_nop
+            elif isinstance(ddof, types.Float):
+                _DDOF_HANDLER = _handle_ddof
+            else:
+                raise TypingError('ddof must be a real numerical scalar type')
+
+        # special case for 2D array input with 1 row of data - select
+        # handler function which we'll call later when we have access
+        # to the shape of the input array
+        _M_DIM_HANDLER = _handle_m_dim_nop
+        if isinstance(m, types.Array):
+            _M_DIM_HANDLER = _handle_m_dim_change
+
+        # infer result dtype
+        m_dt = determine_dtype(m)
+        y_dt = determine_dtype(y)
+        dtype = np.result_type(m_dt, y_dt, np.float64)
+
+        def np_cov_impl(m, y=None, rowvar=True, bias=False, ddof=None):
+            X = _prepare_cov_input(m, y, rowvar, dtype, ddof, _DDOF_HANDLER, _M_DIM_HANDLER).astype(dtype)
+
+            if np.any(np.array(X.shape) == 0):
+                return np.full((X.shape[0], X.shape[0]), fill_value=np.nan, dtype=dtype)
+            else:
+                return np_cov_impl_inner(X, bias, ddof)
+
+        def np_cov_impl_single_variable(m, y=None, rowvar=True, bias=False, ddof=None):
+            X = _prepare_cov_input(m, y, rowvar, ddof, dtype, _DDOF_HANDLER, _M_DIM_HANDLER).astype(dtype)
+
+            if np.any(np.array(X.shape) == 0):
+                variance = np.nan
+            else:
+                variance = np_cov_impl_inner(X, bias, ddof).flat[0]
+
+            return np.array(variance)
+
+        if scalar_result_expected(m, y):
+            return np_cov_impl_single_variable
+        else:
+            return np_cov_impl
+
+    @overload(np.corrcoef)
+    def np_corrcoef(x, y=None, rowvar=True):
+
+        x_dt = determine_dtype(x)
+        y_dt = determine_dtype(y)
+        dtype = np.result_type(x_dt, y_dt, np.float64)
+
+        if dtype == np.complex:
+            clip_fn = _clip_complex
+        else:
+            clip_fn = _clip_corr
+
+        def np_corrcoef_impl(x, y=None, rowvar=True):
+            c = np.cov(x, y, rowvar)
+            d = np.diag(c)
+            stddev = np.sqrt(d.real)
+
+            for i in range(c.shape[0]):
+                c[i, :] /= stddev
+                c[:, i] /= stddev
+
+            return clip_fn(c)
+
+        def np_corrcoef_impl_single_variable(x, y=None, rowvar=True):
+            c = np.cov(x, y, rowvar)
+            return c / c
+
+        if scalar_result_expected(x, y):
+            return np_corrcoef_impl_single_variable
+        else:
+            return np_corrcoef_impl
+
 #----------------------------------------------------------------------------
 # Element-wise computations
+
+@register_jitable
+def _fill_diagonal_params(a, wrap):
+    if a.ndim == 2:
+        m = a.shape[0]
+        n = a.shape[1]
+        step = 1 + n
+        if wrap:
+            end = n * m
+        else:
+            end = n * min(m, n)
+    else:
+        shape = np.array(a.shape)
+
+        if not np.all(np.diff(shape) == 0):
+            raise ValueError("All dimensions of input must be of equal length")
+
+        step = 1 + (np.cumprod(shape[:-1])).sum()
+        end = shape.prod()
+
+    return end, step
+
+@register_jitable
+def _fill_diagonal_scalar(a, val, wrap):
+    end, step = _fill_diagonal_params(a, wrap)
+
+    for i in range(0, end, step):
+        a.flat[i] = val
+
+@register_jitable
+def _fill_diagonal(a, val, wrap):
+    end, step = _fill_diagonal_params(a, wrap)
+    ctr = 0
+    v_len = len(val)
+
+    for i in range(0, end, step):
+        a.flat[i] = val[ctr]
+        ctr += 1
+        ctr = ctr % v_len
+
+@register_jitable
+def _check_val_int(a, val):
+    iinfo = np.iinfo(a.dtype)
+    v_min = iinfo.min
+    v_max = iinfo.max
+
+    # check finite values are within bounds
+    if np.any(~np.isfinite(val)) or np.any(val < v_min) or np.any(val > v_max):
+        raise ValueError('Unable to safely conform val to a.dtype')
+
+@register_jitable
+def _check_val_float(a, val):
+    finfo = np.finfo(a.dtype)
+    v_min = finfo.min
+    v_max = finfo.max
+
+    # check finite values are within bounds
+    finite_vals = val[np.isfinite(val)]
+    if np.any(finite_vals < v_min) or np.any(finite_vals > v_max):
+        raise ValueError('Unable to safely conform val to a.dtype')
+
+# no check performed, needed for pathway where no check is required
+_check_nop = register_jitable(lambda x, y: x)
+
+def _asarray(x):
+    pass
+
+@overload(_asarray)
+def _asarray_impl(x):
+    if isinstance(x, types.Array):
+        return lambda x: x
+    elif isinstance(x, (types.Sequence, types.Tuple)):
+        return lambda x: np.array(x)
+    elif isinstance(x, (types.Number, types.Boolean)):
+        ty = as_dtype(x)
+        return lambda x: np.array([x], dtype=ty)
+
+@overload(np.fill_diagonal)
+def np_fill_diagonal(a, val, wrap=False):
+
+    if a.ndim > 1:
+        # the following can be simplified after #3088; until then, employ
+        # a basic mechanism for catching cases where val is of a type/value
+        # which cannot safely be cast to a.dtype
+        if isinstance(a.dtype, types.Integer):
+            checker = _check_val_int
+        elif isinstance(a.dtype, types.Float):
+            checker = _check_val_float
+        else:
+            checker = _check_nop
+
+        def scalar_impl(a, val, wrap=False):
+            tmpval = _asarray(val).flatten()
+            checker(a, tmpval)
+            _fill_diagonal_scalar(a, val, wrap)
+
+        def non_scalar_impl(a, val, wrap=False):
+            tmpval = _asarray(val).flatten()
+            checker(a, tmpval)
+            _fill_diagonal(a, tmpval, wrap)
+
+        if isinstance(val, (types.Float, types.Integer, types.Boolean)):
+            return scalar_impl
+        elif isinstance(val, (types.Tuple, types.Sequence, types.Array)):
+            return non_scalar_impl
+    else:
+        msg = "The first argument must be at least 2-D (found %s-D)" % a.ndim
+        raise TypingError(msg)
 
 def _np_round_intrinsic(tp):
     # np.round() always rounds half to even
@@ -1124,13 +2195,17 @@ def array_where(context, builder, sig, args):
     np.where(array, array, array)
     """
     layouts = set(a.layout for a in sig.args)
-    if layouts == set('C'):
+
+    npty = np.promote_types(as_dtype(sig.args[1].dtype),
+                            as_dtype(sig.args[2].dtype))
+
+    if layouts == set('C') or layouts == set('F'):
         # Faster implementation for C-contiguous arrays
         def where_impl(cond, x, y):
             shape = cond.shape
             if x.shape != shape or y.shape != shape:
                 raise ValueError("all inputs should have the same shape")
-            res = np.empty_like(x)
+            res = np.empty_like(x, dtype=npty)
             cf = cond.flat
             xf = x.flat
             yf = y.flat
@@ -1139,12 +2214,11 @@ def array_where(context, builder, sig, args):
                 rf[i] = xf[i] if cf[i] else yf[i]
             return res
     else:
-
         def where_impl(cond, x, y):
             shape = cond.shape
             if x.shape != shape or y.shape != shape:
                 raise ValueError("all inputs should have the same shape")
-            res = np.empty_like(x)
+            res = np.empty(cond.shape, dtype=npty)
             for idx, c in np.ndenumerate(cond):
                 res[idx] = x[idx] if c else y[idx]
             return res
@@ -1153,11 +2227,69 @@ def array_where(context, builder, sig, args):
     return impl_ret_untracked(context, builder, sig.return_type, res)
 
 
+@register_jitable
+def _where_x_y_scalar(cond, x, y, res):
+    for idx, c in np.ndenumerate(cond):
+        res[idx] = x if c else y
+    return res
+
+
+@register_jitable
+def _where_x_scalar(cond, x, y, res):
+    for idx, c in np.ndenumerate(cond):
+        res[idx] = x if c else y[idx]
+    return res
+
+
+@register_jitable
+def _where_y_scalar(cond, x, y, res):
+    for idx, c in np.ndenumerate(cond):
+        res[idx] = x[idx] if c else y
+    return res
+
+
+def _where_inner(context, builder, sig, args, impl):
+    cond, x, y = sig.args
+
+    x_dt = determine_dtype(x)
+    y_dt = determine_dtype(y)
+    npty = np.promote_types(x_dt, y_dt)
+
+    if cond.layout == 'F':
+        def where_impl(cond, x, y):
+            res = np.asfortranarray(np.empty(cond.shape, dtype=npty))
+            return impl(cond, x, y, res)
+    else:
+        def where_impl(cond, x, y):
+            res = np.empty(cond.shape, dtype=npty)
+            return impl(cond, x, y, res)
+
+    res = context.compile_internal(builder, where_impl, sig, args)
+    return impl_ret_untracked(context, builder, sig.return_type, res)
+
+
+array_scalar_scalar_where = partial(_where_inner, impl=_where_x_y_scalar)
+array_array_scalar_where = partial(_where_inner, impl=_where_y_scalar)
+array_scalar_array_where = partial(_where_inner, impl=_where_x_scalar)
+
+
 @lower_builtin(np.where, types.Any, types.Any, types.Any)
 def any_where(context, builder, sig, args):
-    cond = sig.args[0]
+    cond, x, y = sig.args
+
     if isinstance(cond, types.Array):
-        return array_where(context, builder, sig, args)
+        if isinstance(x, types.Array):
+            if isinstance(y, types.Array):
+                impl = array_where
+            elif isinstance(y, (types.Number, types.Boolean)):
+                impl = array_array_scalar_where
+        elif isinstance(x, (types.Number, types.Boolean)):
+            if isinstance(y, types.Array):
+                impl = array_scalar_array_where
+            elif isinstance(y, (types.Number, types.Boolean)):
+                impl = array_scalar_scalar_where
+
+        return impl(context, builder, sig, args)
 
     def scalar_where_impl(cond, x, y):
         """
@@ -1312,14 +2444,14 @@ def _searchsorted(func):
         return lo
     return searchsorted_inner
 
-_lt = register_jitable(lambda x, y: x < y)
+_lt = less_than
 _le = register_jitable(lambda x, y: x <= y)
 _searchsorted_left = register_jitable(_searchsorted(_lt))
 _searchsorted_right = register_jitable(_searchsorted(_le))
 
 @overload(np.searchsorted)
 def searchsorted(a, v, side='left'):
-    side_val = getattr(side, 'value', side)
+    side_val = getattr(side, 'literal_value', side)
     if side_val == 'left':
         loop_impl = _searchsorted_left
     elif side_val == 'right':
@@ -1525,7 +2657,7 @@ def np_histogram(a, bins=10, range=None):
     else:
         # With a custom bins array, use a bisection search
 
-        def histogram_impl(a, bins, range=None):
+        def histogram_impl(a, bins=10, range=None):
             nbins = len(bins) - 1
             for i in _range(nbins):
                 # Note this also catches NaNs
@@ -1777,3 +2909,58 @@ def np_convolve(a, v):
             return _np_correlate_core(a, v[::-1], Mode.FULL, 1)
 
     return impl
+
+def _is_nonelike(ty):
+    return (ty is None) or isinstance(ty, types.NoneType)
+
+@overload(np.asarray)
+def np_asarray(a, dtype=None):
+    impl = None
+    if isinstance(a, types.Array):
+        if _is_nonelike(dtype) or a.dtype == dtype.dtype:
+            def impl(a, dtype=None):
+                return a
+        else:
+            def impl(a, dtype=None):
+                return a.astype(dtype)
+    elif isinstance(a, (types.Sequence, types.Tuple)):
+        # Nested lists cannot be unpacked, therefore only single lists are
+        # permitted and these conform to Sequence and can be unpacked along on
+        # the same path as Tuple.
+        if _is_nonelike(dtype):
+            def impl(a, dtype=None):
+                return np.array(a)
+        else:
+            def impl(a, dtype=None):
+                return np.array(a, dtype)
+    elif isinstance(a, (types.Number, types.Boolean)):
+        dt_conv = a if _is_nonelike(dtype) else dtype
+        ty = as_dtype(dt_conv)
+        def impl(a, dtype=None):
+                return np.array(a, ty)
+
+    return impl
+
+@overload(np.extract)
+def np_extract(condition, arr):
+
+    def np_extract_impl(condition, arr):
+        cond = np.asarray(condition).flatten()
+        a = np.asarray(arr)
+
+        if a.size == 0:
+            raise ValueError('Cannot extract from an empty array')
+
+        # the following looks odd but replicates NumPy...
+        if np.any(cond[a.size:]) and cond.size > a.size:
+            msg = 'condition shape inconsistent with arr shape'
+            raise ValueError(msg)
+            # NumPy raises IndexError: index 'm' is out of
+            # bounds for size 'n'
+
+        max_len = min(a.size, cond.size)
+        out = [a.flat[idx] for idx in range(max_len) if cond[idx]]
+
+        return np.array(out)
+
+    return np_extract_impl

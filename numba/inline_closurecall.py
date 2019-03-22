@@ -33,6 +33,7 @@ from numba.analysis import (
 from numba.targets.rangeobj import range_iter_len
 from numba.unsafe.ndarray import empty_inferred as unsafe_empty_inferred
 import numpy as np
+import operator
 
 """
 Variable enable_inline_arraycall is only used for testing purpose.
@@ -44,9 +45,10 @@ class InlineClosureCallPass(object):
     closures, and inlines the body of the closure function to the call site.
     """
 
-    def __init__(self, func_ir, parallel_options):
+    def __init__(self, func_ir, parallel_options, swapped={}):
         self.func_ir = func_ir
         self.parallel_options = parallel_options
+        self.swapped = swapped
         self._processed_stencils = []
 
     def run(self):
@@ -95,7 +97,7 @@ class InlineClosureCallPass(object):
             for k, s in sorted(sized_loops, key=lambda tup: tup[1], reverse=True):
                 visited.append(k)
                 if guard(_inline_arraycall, self.func_ir, cfg, visited, loops[k],
-                         self.parallel_options.comprehension):
+                         self.swapped, self.parallel_options.comprehension):
                     modified = True
             if modified:
                 _fix_nested_array(self.func_ir)
@@ -254,7 +256,7 @@ def inline_closure_call(func_ir, glbls, block, i, callee, typingctx=None,
     callee_blocks = callee_ir.blocks
 
     # 1. relabel callee_ir by adding an offset
-    max_label = max(func_ir.blocks.keys())
+    max_label = max(ir_utils._max_label, max(func_ir.blocks.keys()))
     callee_blocks = add_offset_to_labels(callee_blocks, max_label + 1)
     callee_blocks = simplify_CFG(callee_blocks)
     callee_ir.blocks = callee_blocks
@@ -319,8 +321,13 @@ def inline_closure_call(func_ir, glbls, block, i, callee, typingctx=None,
 
     if typingctx:
         from numba import compiler
-        f_typemap, f_return_type, f_calltypes = compiler.type_inference_stage(
-                typingctx, callee_ir, arg_typs, None)
+        try:
+            f_typemap, f_return_type, f_calltypes = compiler.type_inference_stage(
+                    typingctx, callee_ir, arg_typs, None)
+        except BaseException:
+            f_typemap, f_return_type, f_calltypes = compiler.type_inference_stage(
+                    typingctx, callee_ir, arg_typs, None)
+            pass
         canonicalize_array_math(callee_ir, f_typemap,
                                 f_calltypes, typingctx)
         # remove argument entries like arg.a from typemap
@@ -344,9 +351,12 @@ def inline_closure_call(func_ir, glbls, block, i, callee, typingctx=None,
     # 6. replace Return with assignment to LHS
     topo_order = find_topo_order(callee_blocks)
     _replace_returns(callee_blocks, instr.target, new_label)
-    #    remove the old definition of instr.target too
-    if (instr.target.name in func_ir._definitions):
-        func_ir._definitions[instr.target.name] = []
+
+    # remove the old definition of instr.target too
+    if (instr.target.name in func_ir._definitions
+            and call_expr in func_ir._definitions[instr.target.name]):
+        # NOTE: target can have multiple definitions due to control flow
+        func_ir._definitions[instr.target.name].remove(call_expr)
 
     # 7. insert all new blocks, and add back definitions
     for label in topo_order:
@@ -492,7 +502,7 @@ def _find_arraycall(func_ir, block):
     return list_var, array_stmt_index, array_kws
 
 
-def _find_iter_range(func_ir, range_iter_var):
+def _find_iter_range(func_ir, range_iter_var, swapped):
     """Find the iterator's actual range if it is either range(n), or range(m, n),
     otherwise return raise GuardException.
     """
@@ -509,17 +519,20 @@ def _find_iter_range(func_ir, range_iter_var):
     debug_print("func_var = ", func_var, " func_def = ", func_def)
     require(isinstance(func_def, ir.Global) and func_def.value == range)
     nargs = len(range_def.args)
+    swapping = [('"array comprehension"', 'closure of'), range_def.func.loc]
     if nargs == 1:
+        swapped[range_def.func.name] = swapping
         stop = get_definition(func_ir, range_def.args[0], lhs_only=True)
         return (0, range_def.args[0], func_def)
     elif nargs == 2:
+        swapped[range_def.func.name] = swapping
         start = get_definition(func_ir, range_def.args[0], lhs_only=True)
         stop = get_definition(func_ir, range_def.args[1], lhs_only=True)
         return (start, stop, func_def)
     else:
         raise GuardException
 
-def _inline_arraycall(func_ir, cfg, visited, loop, enable_prange=False):
+def _inline_arraycall(func_ir, cfg, visited, loop, swapped, enable_prange=False):
     """Look for array(list) call in the exit block of a given loop, and turn list operations into
     array operations in the loop if the following conditions are met:
       1. The exit block contains an array call on the list;
@@ -640,7 +653,7 @@ def _inline_arraycall(func_ir, cfg, visited, loop, enable_prange=False):
     # If the range happens to be single step ranges like range(n), or range(m, n),
     # then the index_var correlates to iterator index; otherwise we'll have to
     # define a new counter.
-    range_def = guard(_find_iter_range, func_ir, iter_var)
+    range_def = guard(_find_iter_range, func_ir, iter_var, swapped)
     index_var = ir.Var(scope, mk_unique_var("index"), loc)
     if range_def and range_def[0] == 0:
         # iterator starts with 0, index_var can just be iter_first_var
@@ -656,7 +669,7 @@ def _inline_arraycall(func_ir, cfg, visited, loop, enable_prange=False):
         if start == 0:
             size_val = stop
         else:
-            size_val = ir.Expr.binop(fn='-', lhs=stop, rhs=start, loc=loc)
+            size_val = ir.Expr.binop(fn=operator.sub, lhs=stop, rhs=start, loc=loc)
         # we can parallelize this loop if enable_prange = True, by changing
         # range function from range, to prange.
         if enable_prange and isinstance(range_func_def, ir.Global):
@@ -718,7 +731,7 @@ def _inline_arraycall(func_ir, cfg, visited, loop, enable_prange=False):
             blk = func_ir.blocks[block_id]
             loc = blk.loc
             blk.body.insert(0, _new_definition(func_ir, index_var,
-                ir.Expr.binop(fn='-', lhs=iter_first_var,
+                ir.Expr.binop(fn=operator.sub, lhs=iter_first_var,
                                       rhs=range_def[0], loc=loc),
                 loc))
     else:
@@ -733,7 +746,7 @@ def _inline_arraycall(func_ir, cfg, visited, loop, enable_prange=False):
                      ir.Const(value=1,loc=loc), loc))
         # next_index_var = index_var + 1
         stmts.append(_new_definition(func_ir, next_index_var,
-                     ir.Expr.binop(fn='+', lhs=index_var, rhs=one, loc=loc), loc))
+                     ir.Expr.binop(fn=operator.add, lhs=index_var, rhs=one, loc=loc), loc))
         # index_var = next_index_var
         stmts.append(_new_definition(func_ir, index_var, next_index_var, loc))
         stmts.append(terminator)
@@ -939,37 +952,69 @@ def _inline_const_arraycall(block, func_ir, context, typemap, calltypes):
                            ret_type.ndim == 1)
         loc = expr.loc
         list_var = expr.args[0]
+        # Get the type of the array to be created.
         array_typ = typemap[array_var.name]
         debug_print("inline array_var = ", array_var, " list_var = ", list_var)
+        # Get the element type of the array to be created.
         dtype = array_typ.dtype
-        seq, op = find_build_sequence(func_ir, list_var)
+        # Get the sequence of operations to provide values to the new array.
+        seq, _ = find_build_sequence(func_ir, list_var)
         size = len(seq)
+        # Create a tuple to pass to empty below to specify the new array size.
         size_var = ir.Var(scope, mk_unique_var("size"), loc)
         size_tuple_var = ir.Var(scope, mk_unique_var("size_tuple"), loc)
         size_typ = types.intp
         size_tuple_typ = types.UniTuple(size_typ, 1)
-
         typemap[size_var.name] = size_typ
         typemap[size_tuple_var.name] = size_tuple_typ
-
         stmts.append(_new_definition(func_ir, size_var,
                  ir.Const(size, loc=loc), loc))
-
         stmts.append(_new_definition(func_ir, size_tuple_var,
                  ir.Expr.build_tuple(items=[size_var], loc=loc), loc))
 
+        # The general approach is to create an empty array and then fill
+        # the elements in one-by-one from their specificiation.
+
+        # Get the numpy type to pass to empty.
+        nptype = types.DType(dtype)
+
+        # Create a variable to hold the numpy empty function.
         empty_func = ir.Var(scope, mk_unique_var("empty_func"), loc)
         fnty = get_np_ufunc_typ(np.empty)
-        sig = context.resolve_function_type(fnty, (size_typ,), {})
-        typemap[empty_func.name] = fnty #
+        sig = context.resolve_function_type(fnty, (size_typ,), {'dtype':nptype})
+
+        typemap[empty_func.name] = fnty
 
         stmts.append(_new_definition(func_ir, empty_func,
                          ir.Global('empty', np.empty, loc=loc), loc))
 
-        empty_call = ir.Expr.call(empty_func, [size_var], {}, loc=loc)
-        calltypes[empty_call] = typing.signature(array_typ, size_typ)
+        # We pass two arguments to empty, first the size tuple and second
+        # the dtype of the new array.  Here, we created typ_var which is
+        # the dtype argument of the new array.  typ_var in turn is created
+        # by getattr of the dtype string on the numpy module.
+
+        # Create var for numpy module.
+        g_np_var = ir.Var(scope, mk_unique_var("$np_g_var"), loc)
+        typemap[g_np_var.name] = types.misc.Module(np)
+        g_np = ir.Global('np', np, loc)
+        stmts.append(_new_definition(func_ir, g_np_var, g_np, loc))
+
+        # Create var for result of numpy.<dtype>.
+        typ_var = ir.Var(scope, mk_unique_var("$np_typ_var"), loc)
+        typemap[typ_var.name] = nptype
+        dtype_str = str(dtype)
+        if dtype_str == 'bool':
+            dtype_str = 'bool_'
+        # Get dtype attribute of numpy module.
+        np_typ_getattr = ir.Expr.getattr(g_np_var, dtype_str, loc)
+        stmts.append(_new_definition(func_ir, typ_var, np_typ_getattr, loc))
+
+        # Create the call to numpy.empty passing the size tuple and dtype var.
+        empty_call = ir.Expr.call(empty_func, [size_var, typ_var], {}, loc=loc)
+        calltypes[empty_call] = typing.signature(array_typ, size_typ, nptype)
         stmts.append(_new_definition(func_ir, array_var, empty_call, loc))
 
+        # Fill in the new empty array one-by-one.
         for i in range(size):
             index_var = ir.Var(scope, mk_unique_var("index"), loc)
             index_typ = types.intp

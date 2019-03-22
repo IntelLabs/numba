@@ -3,17 +3,25 @@ from __future__ import print_function, division, absolute_import
 import errno
 import multiprocessing
 import os
+import platform
 import shutil
 import subprocess
 import sys
 import threading
 import warnings
 import inspect
+import pickle
+import weakref
 
 try:
     import jinja2
 except ImportError:
     jinja2 = None
+
+try:
+    import pygments
+except ImportError:
+    pygments = None
 
 import numpy as np
 
@@ -24,11 +32,17 @@ from numba.compiler import compile_isolated
 from numba.errors import NumbaWarning
 from .support import (TestCase, tag, temp_directory, import_dynamic,
                       override_env_config, capture_cache_log, captured_stdout)
+from numba.numpy_support import as_dtype
 from numba.targets import codegen
 from numba.caching import _UserWideCacheLocator
+from numba.dispatcher import Dispatcher
+from numba import parfor
+from .test_linalg import needs_lapack
+from .support import skip_parfors_unsupported
 
 import llvmlite.binding as ll
 
+_is_armv7l = platform.machine() == 'armv7l'
 
 def dummy(x):
     return x
@@ -59,6 +73,7 @@ def generated_usecase(x, y=5):
             return x - y
     return impl
 
+
 def bad_generated_usecase(x, y=5):
     if isinstance(x, types.Complex):
         def impl(x):
@@ -67,6 +82,21 @@ def bad_generated_usecase(x, y=5):
         def impl(x, y=6):
             return x - y
     return impl
+
+
+def dtype_generated_usecase(a, b, dtype=None):
+    if isinstance(dtype, (types.misc.NoneType, types.misc.Omitted)):
+        out_dtype = np.result_type(*(np.dtype(ary.dtype.name)
+                                   for ary in (a, b)))
+    elif isinstance(dtype, (types.DType, types.NumberClass)):
+        out_dtype = as_dtype(dtype)
+    else:
+        raise TypeError("Unhandled Type %s" % type(dtype))
+
+    def _fn(a, b, dtype=None):
+        return np.ones(a.shape, dtype=out_dtype)
+
+    return _fn
 
 
 class BaseTest(TestCase):
@@ -337,6 +367,209 @@ class TestDispatcher(BaseTest):
         [cr] = bar.overloads.values()
         self.assertEqual(len(cr.lifted), 1)
 
+    def test_serialization(self):
+        """
+        Test serialization of Dispatcher objects
+        """
+        @jit(nopython=True)
+        def foo(x):
+            return x + 1
+
+        self.assertEqual(foo(1), 2)
+
+        # get serialization memo
+        memo = Dispatcher._memo
+        Dispatcher._recent.clear()
+        memo_size = len(memo)
+
+        # pickle foo and check memo size
+        serialized_foo = pickle.dumps(foo)
+        # increases the memo size
+        self.assertEqual(memo_size + 1, len(memo))
+
+        # unpickle
+        foo_rebuilt = pickle.loads(serialized_foo)
+        self.assertEqual(memo_size + 1, len(memo))
+
+        self.assertIs(foo, foo_rebuilt)
+
+        # do we get the same object even if we delete all the explict references?
+        id_orig = id(foo_rebuilt)
+        del foo
+        del foo_rebuilt
+        self.assertEqual(memo_size + 1, len(memo))
+        new_foo = pickle.loads(serialized_foo)
+        self.assertEqual(id_orig, id(new_foo))
+
+        # now clear the recent cache
+        ref = weakref.ref(new_foo)
+        del new_foo
+        Dispatcher._recent.clear()
+        self.assertEqual(memo_size, len(memo))
+
+        # show that deserializing creates a new object
+        newer_foo = pickle.loads(serialized_foo)
+        self.assertIs(ref(), None)
+
+    @needs_lapack
+    @unittest.skipIf(_is_armv7l, "Unaligned loads unsupported")
+    def test_misaligned_array_dispatch(self):
+        # for context see issue #2937
+        def foo(a):
+            return np.linalg.matrix_power(a, 1)
+
+        jitfoo = jit(nopython=True)(foo)
+
+        n = 64
+        r = int(np.sqrt(n))
+        dt = np.int8
+        count = np.complex128().itemsize // dt().itemsize
+
+        tmp = np.arange(n * count + 1, dtype=dt)
+
+        # create some arrays as Cartesian production of:
+        # [F/C] x [aligned/misaligned]
+        C_contig_aligned = tmp[:-1].view(np.complex128).reshape(r, r)
+        C_contig_misaligned = tmp[1:].view(np.complex128).reshape(r, r)
+        F_contig_aligned = C_contig_aligned.T
+        F_contig_misaligned = C_contig_misaligned.T
+
+        # checking routine
+        def check(name, a):
+            a[:, :] = np.arange(n, dtype=np.complex128).reshape(r, r)
+            expected = foo(a)
+            got = jitfoo(a)
+            np.testing.assert_allclose(expected, got)
+
+        # The checks must be run in this order to create the dispatch key
+        # sequence that causes invalid dispatch noted in #2937.
+        # The first two should hit the cache as they are aligned, supported
+        # order and under 5 dimensions. The second two should end up in the
+        # fallback path as they are misaligned.
+        check("C_contig_aligned", C_contig_aligned)
+        check("F_contig_aligned", F_contig_aligned)
+        check("C_contig_misaligned", C_contig_misaligned)
+        check("F_contig_misaligned", F_contig_misaligned)
+
+    @unittest.skipIf(_is_armv7l, "Unaligned loads unsupported")
+    def test_immutability_in_array_dispatch(self):
+
+        # RO operation in function
+        def foo(a):
+            return np.sum(a)
+
+        jitfoo = jit(nopython=True)(foo)
+
+        n = 64
+        r = int(np.sqrt(n))
+        dt = np.int8
+        count = np.complex128().itemsize // dt().itemsize
+
+        tmp = np.arange(n * count + 1, dtype=dt)
+
+        # create some arrays as Cartesian production of:
+        # [F/C] x [aligned/misaligned]
+        C_contig_aligned = tmp[:-1].view(np.complex128).reshape(r, r)
+        C_contig_misaligned = tmp[1:].view(np.complex128).reshape(r, r)
+        F_contig_aligned = C_contig_aligned.T
+        F_contig_misaligned = C_contig_misaligned.T
+
+        # checking routine
+        def check(name, a, disable_write_bit=False):
+            a[:, :] = np.arange(n, dtype=np.complex128).reshape(r, r)
+            if disable_write_bit:
+                a.flags.writeable = False
+            expected = foo(a)
+            got = jitfoo(a)
+            np.testing.assert_allclose(expected, got)
+
+        # all of these should end up in the fallback path as they have no write
+        # bit set
+        check("C_contig_aligned", C_contig_aligned, disable_write_bit=True)
+        check("F_contig_aligned", F_contig_aligned, disable_write_bit=True)
+        check("C_contig_misaligned", C_contig_misaligned,
+              disable_write_bit=True)
+        check("F_contig_misaligned", F_contig_misaligned,
+              disable_write_bit=True)
+
+    @needs_lapack
+    @unittest.skipIf(_is_armv7l, "Unaligned loads unsupported")
+    def test_misaligned_high_dimension_array_dispatch(self):
+
+        def foo(a):
+            return np.linalg.matrix_power(a[0, 0, 0, 0, :, :], 1)
+
+        jitfoo = jit(nopython=True)(foo)
+
+        def check_properties(arr, layout, aligned):
+            self.assertEqual(arr.flags.aligned, aligned)
+            if layout == "C":
+                self.assertEqual(arr.flags.c_contiguous, True)
+            if layout == "F":
+                self.assertEqual(arr.flags.f_contiguous, True)
+
+        n = 729
+        r = 3
+        dt = np.int8
+        count = np.complex128().itemsize // dt().itemsize
+
+        tmp = np.arange(n * count + 1, dtype=dt)
+
+        # create some arrays as Cartesian production of:
+        # [F/C] x [aligned/misaligned]
+        C_contig_aligned = tmp[:-1].view(np.complex128).\
+            reshape(r, r, r, r, r, r)
+        check_properties(C_contig_aligned, 'C', True)
+        C_contig_misaligned = tmp[1:].view(np.complex128).\
+            reshape(r, r, r, r, r, r)
+        check_properties(C_contig_misaligned, 'C', False)
+        F_contig_aligned = C_contig_aligned.T
+        check_properties(F_contig_aligned, 'F', True)
+        F_contig_misaligned = C_contig_misaligned.T
+        check_properties(F_contig_misaligned, 'F', False)
+
+        # checking routine
+        def check(name, a):
+            a[:, :] = np.arange(n, dtype=np.complex128).\
+                reshape(r, r, r, r, r, r)
+            expected = foo(a)
+            got = jitfoo(a)
+            np.testing.assert_allclose(expected, got)
+
+        # these should all hit the fallback path as the cache is only for up to
+        # 5 dimensions
+        check("F_contig_misaligned", F_contig_misaligned)
+        check("C_contig_aligned", C_contig_aligned)
+        check("F_contig_aligned", F_contig_aligned)
+        check("C_contig_misaligned", C_contig_misaligned)
+
+    def test_dispatch_recompiles_for_scalars(self):
+        # for context #3612, essentially, compiling a lambda x:x for a
+        # numerically wide type (everything can be converted to a complex128)
+        # and then calling again with e.g. an int32 would lead to the int32
+        # being converted to a complex128 whereas it ought to compile an int32
+        # specialization.
+        def foo(x):
+            return x
+
+        # jit and compile on dispatch for 3 scalar types, expect 3 signatures
+        jitfoo = jit(nopython=True)(foo)
+        jitfoo(np.complex128(1 + 2j))
+        jitfoo(np.int32(10))
+        jitfoo(np.bool_(False))
+        self.assertEqual(len(jitfoo.signatures), 3)
+        expected_sigs = [(types.complex128,), (types.int32,), (types.bool_,)]
+        self.assertEqual(jitfoo.signatures, expected_sigs)
+
+        # now jit with signatures so recompilation is forbidden
+        # expect 1 signature and type conversion
+        jitfoo = jit([(types.complex128,)], nopython=True)(foo)
+        jitfoo(np.complex128(1 + 2j))
+        jitfoo(np.int32(10))
+        jitfoo(np.bool_(False))
+        self.assertEqual(len(jitfoo.signatures), 1)
+        expected_sigs = [(types.complex128,)]
+        self.assertEqual(jitfoo.signatures, expected_sigs)
 
 class TestSignatureHandling(BaseTest):
     """
@@ -440,6 +673,16 @@ class TestGeneratedDispatcher(TestCase):
         self.assertEqual(f(1j), 5 + 1j)
         self.assertEqual(f(1j, 42), 42 + 1j)
         self.assertEqual(f(x=1j, y=7), 7 + 1j)
+
+
+    @tag('important')
+    def test_generated_dtype(self):
+        f = generated_jit(nopython=True)(dtype_generated_usecase)
+        a = np.ones((10,), dtype=np.float32)
+        b = np.ones((10,), dtype=np.float64)
+        self.assertEqual(f(a, b).dtype, np.float64)
+        self.assertEqual(f(a, b, dtype=np.dtype('int32')).dtype, np.int32)
+        self.assertEqual(f(a, b, dtype=np.int32).dtype, np.int32)
 
     def test_signature_errors(self):
         """
@@ -617,6 +860,7 @@ class TestDispatcherMethods(TestCase):
         foo.inspect_types(utils.StringIO())
 
     @unittest.skipIf(jinja2 is None, "please install the 'jinja2' package")
+    @unittest.skipIf(pygments is None, "please install the 'pygments' package")
     def test_inspect_types_pretty(self):
         @jit
         def foo(a, b):
@@ -911,16 +1155,18 @@ class TestCache(BaseCacheUsecasesTest):
         # a warning.
         mod = self.import_module()
 
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter('always', NumbaWarning)
+        for f in [mod.use_c_sin, mod.use_c_sin_nest1, mod.use_c_sin_nest2]:
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter('always', NumbaWarning)
 
-            f = mod.use_c_sin
-            self.assertPreciseEqual(f(0.0), 0.0)
-            self.check_pycache(0)
+                self.assertPreciseEqual(f(0.0), 0.0)
+                self.check_pycache(0)
 
-        self.assertEqual(len(w), 1)
-        self.assertIn('Cannot cache compiled function "use_c_sin"',
-                      str(w[0].message))
+            self.assertEqual(len(w), 1)
+            self.assertIn(
+                'Cannot cache compiled function "{}"'.format(f.__name__),
+                str(w[0].message),
+                )
 
     def test_closure(self):
         mod = self.import_module()
@@ -1135,6 +1381,30 @@ class TestCache(BaseCacheUsecasesTest):
         # Run a second time and check caching
         err = execute_with_input()
         self.assertIn("cache hits = 1", err.strip())
+
+
+@skip_parfors_unsupported
+class TestSequentialParForsCache(BaseCacheUsecasesTest):
+    def setUp(self):
+        super(TestSequentialParForsCache, self).setUp()
+        # Turn on sequential parfor lowering
+        parfor.sequential_parfor_lowering = True
+
+    def tearDown(self):
+        super(TestSequentialParForsCache, self).tearDown()
+        # Turn off sequential parfor lowering
+        parfor.sequential_parfor_lowering = False
+
+    def test_caching(self):
+        mod = self.import_module()
+        self.check_pycache(0)
+        f = mod.parfor_usecase
+        ary = np.ones(10)
+        self.assertPreciseEqual(f(ary), ary * ary + ary)
+        dynamic_globals = [cres.library.has_dynamic_globals
+                           for cres in f.overloads.values()]
+        self.assertEqual(dynamic_globals, [False])
+        self.check_pycache(2)  # 1 index, 1 data
 
 
 class TestCacheWithCpuSetting(BaseCacheUsecasesTest):
