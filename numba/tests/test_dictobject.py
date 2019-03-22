@@ -8,12 +8,19 @@ in test_dictimpl.py.
 from __future__ import print_function, absolute_import, division
 
 import sys
+
 import numpy as np
+
 from numba import njit, utils
 from numba import int32, int64, float32, float64, types
 from numba import dictobject
+from numba.typed import Dict
+from numba.utils import IS_PY3
 from numba.errors import TypingError
 from .support import TestCase, MemoryLeakMixin, unittest
+
+
+skip_py2 = unittest.skipUnless(IS_PY3, reason='not supported in py2')
 
 
 class TestDictObject(MemoryLeakMixin, TestCase):
@@ -515,6 +522,36 @@ class TestDictObject(MemoryLeakMixin, TestCase):
         # dict != tuple[int]
         self.assertFalse(foo(10, (1,)))
 
+    def test_dict_to_from_meminfo(self):
+        """
+        Exercise dictobject.{_as_meminfo, _from_meminfo}
+        """
+        @njit
+        def make_content(nelem):
+            for i in range(nelem):
+                yield i, i + (i + 1) / 100
+
+        @njit
+        def boxer(nelem):
+            d = dictobject.new_dict(int32, float64)
+            for k, v in make_content(nelem):
+                d[k] = v
+            return dictobject._as_meminfo(d)
+
+        dcttype = types.DictType(int32, float64)
+
+        @njit
+        def unboxer(mi):
+            d = dictobject._from_meminfo(mi, dcttype)
+            return list(d.items())
+
+        mi = boxer(10)
+        self.assertEqual(mi.refcount, 1)
+
+        got = unboxer(mi)
+        expected = list(make_content.py_func(10))
+        self.assertEqual(got, expected)
+
     def test_001_cannot_downcast_key(self):
         @njit
         def foo(n):
@@ -788,9 +825,8 @@ class TestDictObject(MemoryLeakMixin, TestCase):
 
         print(foo())
 
-    @unittest.skip("refct")
-    def test_020(self):
-        # this should work ?!
+    @skip_py2
+    def test_020_string_key(self):
         @njit
         def foo():
             d = dictobject.new_dict(types.unicode_type, float64)
@@ -798,15 +834,17 @@ class TestDictObject(MemoryLeakMixin, TestCase):
             d['b'] = 2.
             d['c'] = 3.
             d['d'] = 4.
+            out = []
             for x in d.items():
-                print(x)
-            return d['a']
+                out.append(x)
+            return out, d['a']
 
-        print(foo())
+        items, da = foo()
+        self.assertEqual(items, [('a', 1.), ('b', 2.), ('c', 3.), ('d', 4)])
+        self.assertEqual(da, 1.)
 
-    @unittest.skip("refct")
-    def test_021(self):
-        # this should work ?!
+    @skip_py2
+    def test_021_long_str_key(self):
         @njit
         def foo():
             d = dictobject.new_dict(types.unicode_type, float64)
@@ -814,17 +852,12 @@ class TestDictObject(MemoryLeakMixin, TestCase):
             for i in range(10000):
                 tmp.append('a')
             s = ''.join(tmp)
-            print(s)
             d[s] = 1.
-            # this prints out weirdly, issue may well be print related.
-            for x in d.items():
-                print(x)
-
-        print(foo())
+            out = list(d.items())
+            return out
+        self.assertEqual(foo(), [('a' * 10000, 1)])
 
     def test_022_references_juggle(self):
-        # this should work, llvmlite level broken, probably the same problem as
-        # before, intent of test is to juggle references about
         @njit
         def foo():
             d = dictobject.new_dict(int32, float64)
@@ -860,3 +893,371 @@ class TestDictObject(MemoryLeakMixin, TestCase):
             return [x for x in d.keys()]
 
         self.assertEqual(foo(), [1, 2])
+
+
+class TestDictTypeCasting(TestCase):
+    def check_good(self, fromty, toty):
+        dictobject._sentry_safe_cast(fromty, toty)
+
+    def check_bad(self, fromty, toty):
+        with self.assertRaises(TypingError) as raises:
+            dictobject._sentry_safe_cast(fromty, toty)
+        self.assertIn(
+            'cannot safely cast {fromty} to {toty}'.format(**locals()),
+            str(raises.exception),
+        )
+
+    def test_cast_int_to(self):
+        self.check_good(types.int32, types.float32)
+        self.check_good(types.int32, types.float64)
+        self.check_good(types.int32, types.complex128)
+        self.check_good(types.int64, types.complex128)
+        self.check_bad(types.int32, types.complex64)
+        self.check_good(types.int8, types.complex64)
+
+    def test_cast_float_to(self):
+        self.check_good(types.float32, types.float64)
+        self.check_good(types.float32, types.complex64)
+        self.check_good(types.float64, types.complex128)
+
+    def test_cast_bool_to(self):
+        self.check_good(types.boolean, types.int32)
+        self.check_good(types.boolean, types.float64)
+        self.check_good(types.boolean, types.complex128)
+
+
+class TestTypedDict(MemoryLeakMixin, TestCase):
+    def test_basic(self):
+        d = Dict.empty(int32, float32)
+        # len
+        self.assertEqual(len(d), 0)
+        # setitems
+        d[1] = 1
+        d[2] = 2.3
+        d[3] = 3.4
+        self.assertEqual(len(d), 3)
+        # keys
+        self.assertEqual(list(d.keys()), [1, 2, 3])
+        # values
+        for x, y in zip(list(d.values()), [1, 2.3, 3.4]):
+            self.assertAlmostEqual(x, y, places=4)
+        # getitem
+        self.assertAlmostEqual(d[1], 1)
+        self.assertAlmostEqual(d[2], 2.3, places=4)
+        self.assertAlmostEqual(d[3], 3.4, places=4)
+        # deltiem
+        del d[2]
+        self.assertEqual(len(d), 2)
+        # get
+        self.assertIsNone(d.get(2))
+        # setdefault
+        d.setdefault(2, 100)
+        d.setdefault(3, 200)
+        self.assertEqual(d[2], 100)
+        self.assertAlmostEqual(d[3], 3.4, places=4)
+        # update
+        d.update({4: 5, 5: 6})
+        self.assertAlmostEqual(d[4], 5)
+        self.assertAlmostEqual(d[5], 6)
+        # contains
+        self.assertTrue(4 in d)
+        # items
+        pyd = dict(d.items())
+        self.assertEqual(len(pyd), len(d))
+        # pop
+        self.assertAlmostEqual(d.pop(4), 5)
+        # popitem
+        nelem = len(d)
+        k, v = d.popitem()
+        self.assertEqual(len(d), nelem - 1)
+        self.assertTrue(k not in d)
+        # __eq__ & copy
+        copied = d.copy()
+        self.assertEqual(copied, d)
+        self.assertEqual(list(copied.items()), list(d.items()))
+
+    def test_copy_from_dict(self):
+        expect = {k: float(v) for k, v in zip(range(10), range(10, 20))}
+        nbd = Dict.empty(int32, float64)
+        for k, v in expect.items():
+            nbd[k] = v
+        got = dict(nbd)
+        self.assertEqual(got, expect)
+
+    def test_compiled(self):
+        @njit
+        def producer():
+            d = Dict.empty(int32, float64)
+            d[1] = 1.23
+            return d
+
+        @njit
+        def consumer(d):
+            return d[1]
+
+        d = producer()
+        val = consumer(d)
+        self.assertEqual(val, 1.23)
+
+    def check_stringify(self, strfn, prefix=False):
+        nbd = Dict.empty(int32, int32)
+        d = {}
+        nbd[1] = 2
+        d[1] = 2
+        checker = self.assertIn if prefix else self.assertEqual
+        checker(strfn(d), strfn(nbd))
+        nbd[2] = 3
+        d[2] = 3
+        checker(strfn(d), strfn(nbd))
+        for i in range(10, 20):
+            nbd[i] = i + 1
+            d[i] = i + 1
+        checker(strfn(d), strfn(nbd))
+        if prefix:
+            self.assertTrue(strfn(nbd).startswith('DictType'))
+
+    def test_repr(self):
+        self.check_stringify(repr, prefix=True)
+
+    def test_str(self):
+        self.check_stringify(str)
+
+
+class TestDictRefctTypes(MemoryLeakMixin, TestCase):
+    @skip_py2
+    def test_str_key(self):
+        @njit
+        def foo():
+            d = Dict.empty(
+                key_type=types.unicode_type,
+                value_type=types.int32,
+            )
+            d["123"] = 123
+            d["321"] = 321
+            return d
+
+        d = foo()
+        self.assertEqual(d['123'], 123)
+        self.assertEqual(d['321'], 321)
+        expect = {'123': 123, '321': 321}
+        self.assertEqual(dict(d), expect)
+        # Test insert replacement
+        d['123'] = 231
+        expect['123'] = 231
+        self.assertEqual(d['123'], 231)
+        self.assertEqual(dict(d), expect)
+        # Test dictionary growth
+        nelem = 100
+        for i in range(nelem):
+            d[str(i)] = i
+            expect[str(i)] = i
+        for i in range(nelem):
+            self.assertEqual(d[str(i)], i)
+        self.assertEqual(dict(d), expect)
+
+    @skip_py2
+    def test_str_val(self):
+        @njit
+        def foo():
+            d = Dict.empty(
+                key_type=types.int32,
+                value_type=types.unicode_type,
+            )
+            d[123] = "123"
+            d[321] = "321"
+            return d
+
+        d = foo()
+        self.assertEqual(d[123], '123')
+        self.assertEqual(d[321], '321')
+        expect = {123: '123', 321: '321'}
+        self.assertEqual(dict(d), expect)
+        # Test insert replacement
+        d[123] = "231"
+        expect[123] = "231"
+        self.assertEqual(dict(d), expect)
+        # Test dictionary growth
+        nelem = 1
+        for i in range(nelem):
+            d[i] = str(i)
+            expect[i] = str(i)
+        for i in range(nelem):
+            self.assertEqual(d[i], str(i))
+        self.assertEqual(dict(d), expect)
+
+    @skip_py2
+    def test_str_key_array_value(self):
+        np.random.seed(123)
+        d = Dict.empty(
+            key_type=types.unicode_type,
+            value_type=types.float64[:],
+        )
+        expect = []
+        expect.append(np.random.random(10))
+        d['mass'] = expect[-1]
+        expect.append(np.random.random(20))
+        d['velocity'] = expect[-1]
+        for i in range(100):
+            expect.append(np.random.random(i))
+            d[str(i)] = expect[-1]
+        self.assertEqual(len(d), len(expect))
+        self.assertPreciseEqual(d['mass'], expect[0])
+        self.assertPreciseEqual(d['velocity'], expect[1])
+        # Ordering is kept
+        for got, exp in zip(d.values(), expect):
+            self.assertPreciseEqual(got, exp)
+
+        # Try deleting
+        self.assertTrue('mass' in d)
+        self.assertTrue('velocity' in d)
+        del d['mass']
+        self.assertFalse('mass' in d)
+        del d['velocity']
+        self.assertFalse('velocity' in d)
+        del expect[0:2]
+
+        for i in range(90):
+            k, v = d.popitem()
+            w = expect.pop()
+            self.assertPreciseEqual(v, w)
+
+        # Trigger a resize
+        expect.append(np.random.random(10))
+        d["last"] = expect[-1]
+
+        # Ordering is kept
+        for got, exp in zip(d.values(), expect):
+            self.assertPreciseEqual(got, exp)
+
+    def test_dict_of_dict_int_keyval(self):
+        def inner_numba_dict():
+            d = Dict.empty(
+                key_type=types.intp,
+                value_type=types.intp,
+            )
+            return d
+
+        d = Dict.empty(
+            key_type=types.intp,
+            value_type=types.DictType(types.intp, types.intp),
+        )
+
+        def usecase(d, make_inner_dict):
+            for i in range(100):
+                mid = make_inner_dict()
+                for j in range(i + 1):
+                    mid[j] = j * 10000
+                d[i] = mid
+            return d
+
+        got = usecase(d, inner_numba_dict)
+        expect = usecase({}, dict)
+
+        self.assertIsInstance(expect, dict)
+
+        self.assertEqual(dict(got), expect)
+
+        # Delete items
+        for where in [12, 3, 6, 8, 10]:
+            del got[where]
+            del expect[where]
+            self.assertEqual(dict(got), expect)
+
+    def test_dict_of_dict_npm(self):
+        inner_dict_ty = types.DictType(types.intp, types.intp)
+
+        @njit
+        def inner_numba_dict():
+            d = Dict.empty(
+                key_type=types.intp,
+                value_type=types.intp,
+            )
+            return d
+
+        @njit
+        def foo(count):
+            d = Dict.empty(
+                key_type=types.intp,
+                value_type=inner_dict_ty,
+            )
+            for i in range(count):
+                d[i] = inner_numba_dict()
+                for j in range(i + 1):
+                    d[i][j] = j
+
+            return d
+
+        d = foo(100)
+        ct = 0
+        for k, dd in d.items():
+            ct += 1
+            self.assertEqual(len(dd), k + 1)
+            for kk, vv in dd.items():
+                self.assertEqual(kk, vv)
+
+        self.assertEqual(ct, 100)
+
+    @skip_py2
+    def test_delitem(self):
+        d = Dict.empty(types.int64, types.unicode_type)
+        d[1] = 'apple'
+
+        @njit
+        def foo(x, k):
+            del x[1]
+
+        foo(d, 1)
+        self.assertEqual(len(d), 0)
+        self.assertFalse(d)
+
+    def test_getitem_return_type(self):
+        # Dict.__getitem__ must return non-optional type.
+        d = Dict.empty(types.int64, types.int64[:])
+        d[1] = np.arange(10, dtype=np.int64)
+
+        @njit
+        def foo(d):
+            d[1] += 100
+            return d[1]
+
+        foo(d)
+        # Return type is an array, not optional
+        retty = foo.nopython_signatures[0].return_type
+        self.assertIsInstance(retty, types.Array)
+        self.assertNotIsInstance(retty, types.Optional)
+        # Value is correctly updated
+        self.assertPreciseEqual(d[1], np.arange(10, dtype=np.int64) + 100)
+
+
+class TestDictForbiddenTypes(TestCase):
+    def assert_disallow(self, expect, callable):
+        with self.assertRaises(TypingError) as raises:
+            callable()
+        msg = str(raises.exception)
+        self.assertIn(expect, msg)
+
+    def assert_disallow_key(self, ty):
+        msg = '{} as key is forbidded'.format(ty)
+        self.assert_disallow(msg, lambda: Dict.empty(ty, types.intp))
+
+        @njit
+        def foo():
+            Dict.empty(ty, types.intp)
+        self.assert_disallow(msg, foo)
+
+    def assert_disallow_value(self, ty):
+        msg = '{} as value is forbidded'.format(ty)
+        self.assert_disallow(msg, lambda: Dict.empty(types.intp, ty))
+
+        @njit
+        def foo():
+            Dict.empty(types.intp, ty)
+        self.assert_disallow(msg, foo)
+
+    def test_disallow_list(self):
+        self.assert_disallow_key(types.List(types.intp))
+        self.assert_disallow_value(types.List(types.intp))
+
+    def test_disallow_set(self):
+        self.assert_disallow_key(types.Set(types.intp))
+        self.assert_disallow_value(types.Set(types.intp))

@@ -30,16 +30,21 @@ from numba.types import (
     Type,
 )
 from numba.typeconv import Conversion
-from numba.targets.imputils import impl_ret_borrowed
+from numba.targets.imputils import impl_ret_borrowed, RefType
 from numba.errors import TypingError
+from numba import typing
 
 
 ll_dict_type = cgutils.voidptr_t
 ll_dictiter_type = cgutils.voidptr_t
+ll_voidptr_type = cgutils.voidptr_t
 ll_status = cgutils.int32_t
 ll_ssize_t = cgutils.intp_t
 ll_hash = ll_ssize_t
 ll_bytes = cgutils.voidptr_t
+
+
+_meminfo_dictptr = types.MemInfoPointer(types.voidptr)
 
 
 # The following enums must match _dictobject.c
@@ -77,7 +82,7 @@ def new_dict(key, value):
 class DictModel(models.StructModel):
     def __init__(self, dmm, fe_type):
         members = [
-            ('meminfo', types.MemInfoPointer(types.voidptr)),
+            ('meminfo', _meminfo_dictptr),
             ('data', types.voidptr),   # ptr to the C dict
         ]
         super(DictModel, self).__init__(dmm, fe_type, members)
@@ -102,6 +107,62 @@ def _raise_if_error(context, builder, status, msg):
     ok_status = status.type(int(Status.OK))
     with builder.if_then(builder.icmp_signed('!=', status, ok_status)):
         context.call_conv.return_user_exc(builder, RuntimeError, (msg,))
+
+
+@intrinsic
+def _as_meminfo(typingctx, dctobj):
+    """Returns the MemInfoPointer of a dictionary.
+    """
+    if not isinstance(dctobj, types.DictType):
+        raise TypingError('expected *dctobj* to be a DictType')
+
+    def codegen(context, builder, sig, args):
+        [td] = sig.args
+        [d] = args
+        # Incref
+        context.nrt.incref(builder, td, d)
+        ctor = cgutils.create_struct_proxy(td)
+        dstruct = ctor(context, builder, value=d)
+        # Returns the plain MemInfo
+        return dstruct.meminfo
+
+    sig = _meminfo_dictptr(dctobj)
+    return sig, codegen
+
+
+@intrinsic
+def _from_meminfo(typingctx, mi, dicttyperef):
+    """Recreate a dictionary from a MemInfoPointer
+    """
+    if mi != _meminfo_dictptr:
+        raise TypingError('expected a MemInfoPointer for dict.')
+    dicttype = dicttyperef.instance_type
+    if not isinstance(dicttype, DictType):
+        raise TypingError('expected a {}'.format(DictType))
+
+    def codegen(context, builder, sig, args):
+        [tmi, tdref] = sig.args
+        td = tdref.instance_type
+        [mi, _] = args
+
+        ctor = cgutils.create_struct_proxy(td)
+        dstruct = ctor(context, builder)
+
+        data_pointer = context.nrt.meminfo_data(builder, mi)
+        data_pointer = builder.bitcast(data_pointer, ll_dict_type.as_pointer())
+
+        dstruct.data = builder.load(data_pointer)
+        dstruct.meminfo = mi
+
+        return impl_ret_borrowed(
+            context,
+            builder,
+            dicttype,
+            dstruct._getvalue(),
+        )
+
+    sig = dicttype(mi, dicttyperef)
+    return sig, codegen
 
 
 def _call_dict_free(context, builder, ptr):
@@ -166,6 +227,9 @@ def _sentry_safe_cast(fromty, toty):
         if isinstance(fromty, types.Integer) and isinstance(toty, types.Float):
             # Accept if ints to floats
             return
+        if isinstance(fromty, types.Float) and isinstance(toty, types.Float):
+            # Accept if floats to floats
+            return
         raise TypingError('cannot safely cast {} to {}'.format(fromty, toty))
 
 
@@ -187,6 +251,7 @@ def _cast(typingctx, val, typ):
     """
     def codegen(context, builder, signature, args):
         [val, typ] = args
+        context.nrt.incref(builder, signature.return_type, val)
         return val
     # Using implicit casting in argument types
     casted = typ.instance_type
@@ -203,6 +268,7 @@ def _nonoptional(typingctx, val):
         raise TypeError('expected an optional')
 
     def codegen(context, builder, sig, args):
+        context.nrt.incref(builder, sig.return_type, args[0])
         return args[0]
 
     casted = val.type
@@ -247,6 +313,154 @@ def _dict_new_minsize(typingctx, keyty, valty):
         )
         dp = builder.load(refdp)
         return dp
+
+    return sig, codegen
+
+
+def _get_incref_decref(context, module, datamodel):
+    assert datamodel.contains_nrt_meminfo()
+
+    fe_type = datamodel.fe_type
+    data_ptr_ty = datamodel.get_data_type().as_pointer()
+    refct_fnty = ir.FunctionType(ir.VoidType(), [data_ptr_ty])
+    incref_fn = module.get_or_insert_function(
+        refct_fnty,
+        name='.numba_dict_incref${}'.format(fe_type),
+    )
+    builder = ir.IRBuilder(incref_fn.append_basic_block())
+    context.nrt.incref(builder, fe_type, builder.load(incref_fn.args[0]))
+    builder.ret_void()
+
+    decref_fn = module.get_or_insert_function(
+        refct_fnty,
+        name='.numba_dict_decref${}'.format(fe_type),
+    )
+    builder = ir.IRBuilder(decref_fn.append_basic_block())
+    context.nrt.decref(builder, fe_type, builder.load(decref_fn.args[0]))
+    builder.ret_void()
+
+    return incref_fn, decref_fn
+
+
+def _get_equal(context, module, datamodel):
+    assert datamodel.contains_nrt_meminfo()
+
+    fe_type = datamodel.fe_type
+    data_ptr_ty = datamodel.get_data_type().as_pointer()
+
+    wrapfnty = context.call_conv.get_function_type(types.int32, [fe_type, fe_type])
+    argtypes = [fe_type, fe_type]
+
+    def build_wrapper(fn):
+        builder = ir.IRBuilder(fn.append_basic_block())
+        args = context.call_conv.decode_arguments(builder, argtypes, fn)
+
+        sig = typing.signature(types.boolean, fe_type, fe_type)
+        op = operator.eq
+        fnop = context.typing_context.resolve_value_type(op)
+        fnop.get_call_type(context.typing_context, sig.args, {})
+        eqfn = context.get_function(fnop, sig)
+        res = eqfn(builder, args)
+        intres = context.cast(builder, res, types.boolean, types.int32)
+        context.call_conv.return_value(builder, intres)
+
+    wrapfn = module.get_or_insert_function(
+        wrapfnty,
+        name='.numba_dict_key_equal.wrap${}'.format(fe_type)
+    )
+    build_wrapper(wrapfn)
+
+    equal_fnty = ir.FunctionType(ir.IntType(32), [data_ptr_ty, data_ptr_ty])
+    equal_fn = module.get_or_insert_function(
+        equal_fnty,
+        name='.numba_dict_key_equal${}'.format(fe_type),
+    )
+    builder = ir.IRBuilder(equal_fn.append_basic_block())
+    lhs = datamodel.load_from_data_pointer(builder, equal_fn.args[0])
+    rhs = datamodel.load_from_data_pointer(builder, equal_fn.args[1])
+
+    status, retval = context.call_conv.call_function(
+        builder, wrapfn, types.boolean, argtypes, [lhs, rhs],
+    )
+    with builder.if_then(status.is_ok, likely=True):
+        with builder.if_then(status.is_none):
+            builder.ret(context.get_constant(types.int32, 0))
+        retval = context.cast(builder, retval, types.boolean, types.int32)
+        builder.ret(retval)
+    # Error out
+    builder.ret(context.get_constant(types.int32, -1))
+
+    return equal_fn
+
+
+@intrinsic
+def _dict_set_method_table(typingctx, dp, keyty, valty):
+    """Wrap numba_dict_set_method_table
+    """
+    resty = types.void
+    sig = resty(dp, keyty, valty)
+
+    def codegen(context, builder, sig, args):
+        vtablety = ir.LiteralStructType([
+            ll_voidptr_type,  # equal
+            ll_voidptr_type,  # key incref
+            ll_voidptr_type,  # key decref
+            ll_voidptr_type,  # val incref
+            ll_voidptr_type,  # val decref
+        ])
+        setmethod_fnty = ir.FunctionType(
+            ir.VoidType(),
+            [ll_dict_type, vtablety.as_pointer()]
+        )
+        setmethod_fn = ir.Function(
+            builder.module,
+            setmethod_fnty,
+            name='numba_dict_set_method_table',
+        )
+        dp = args[0]
+        vtable = cgutils.alloca_once(builder, vtablety, zfill=True)
+
+        # install key incref/decref
+        key_equal_ptr = cgutils.gep_inbounds(builder, vtable, 0, 0)
+        key_incref_ptr = cgutils.gep_inbounds(builder, vtable, 0, 1)
+        key_decref_ptr = cgutils.gep_inbounds(builder, vtable, 0, 2)
+        val_incref_ptr = cgutils.gep_inbounds(builder, vtable, 0, 3)
+        val_decref_ptr = cgutils.gep_inbounds(builder, vtable, 0, 4)
+
+        dm_key = context.data_model_manager[keyty.instance_type]
+        if dm_key.contains_nrt_meminfo():
+            equal = _get_equal(context, builder.module, dm_key)
+            key_incref, key_decref = _get_incref_decref(
+                context, builder.module, dm_key,
+            )
+            builder.store(
+                builder.bitcast(equal, key_equal_ptr.type.pointee),
+                key_equal_ptr,
+            )
+            builder.store(
+                builder.bitcast(key_incref, key_incref_ptr.type.pointee),
+                key_incref_ptr,
+            )
+            builder.store(
+                builder.bitcast(key_decref, key_decref_ptr.type.pointee),
+                key_decref_ptr,
+            )
+
+        dm_val = context.data_model_manager[valty.instance_type]
+        if dm_val.contains_nrt_meminfo():
+            val_incref, val_decref = _get_incref_decref(
+                context, builder.module, dm_val,
+            )
+            builder.store(
+                builder.bitcast(val_incref, val_incref_ptr.type.pointee),
+                val_incref_ptr,
+            )
+            builder.store(
+                builder.bitcast(val_decref, val_decref_ptr.type.pointee),
+                val_decref_ptr,
+            )
+
+        builder.call(setmethod_fn, [dp, vtable])
 
     return sig, codegen
 
@@ -386,6 +600,7 @@ def _dict_lookup(typingctx, d, key, hashval):
 
         with builder.if_then(found):
             val = dm_val.load_from_data_pointer(builder, ptr_val)
+            context.nrt.incref(builder, td.value_type, val)
             loaded = context.make_optional_value(builder, td.value_type, val)
             builder.store(loaded, pout)
 
@@ -574,6 +789,7 @@ def impl_new_dict(key, value):
 
     def imp(key, value):
         dp = _dict_new_minsize(keyty, valty)
+        _dict_set_method_table(dp, keyty, valty)
         d = _make_dict(keyty, valty, dp)
         return d
 
@@ -643,14 +859,14 @@ def impl_getitem(d, key):
     keyty = d.key_type
 
     def impl(d, key):
-        key = _cast(key, keyty)
-        ix, val = _dict_lookup(d, key, hash(key))
+        castedkey = _cast(key, keyty)
+        ix, val = _dict_lookup(d, castedkey, hash(castedkey))
         if ix == DKIX.EMPTY:
             raise KeyError()
         elif ix < DKIX.EMPTY:
             raise AssertionError("internal dict error during lookup")
         else:
-            return val
+            return _nonoptional(val)
 
     return impl
 
@@ -762,6 +978,7 @@ def impl_setdefault(dct, key, default=None):
     def impl(dct, key, default=None):
         if key not in dct:
             dct[key] = default
+        return dct[key]
 
     return impl
 
@@ -909,7 +1126,7 @@ def impl_dict_getiter(context, builder, sig, args):
 
 
 @lower_builtin('iternext', types.DictIteratorType)
-@iternext_impl
+@iternext_impl(RefType.BORROWED)
 def impl_iterator_iternext(context, builder, sig, args, result):
     iter_type = sig.args[0]
     it = context.make_helper(builder, iter_type, args[0])

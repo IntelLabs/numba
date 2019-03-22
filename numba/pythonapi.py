@@ -1213,7 +1213,10 @@ class PythonAPI(object):
 
     def sys_write_stdout(self, fmt, *args):
         fnty = Type.function(Type.void(), [self.cstring], var_arg=True)
-        fn = self._get_function(fnty, name="PySys_WriteStdout")
+        if PYVERSION >= (3, 2):
+            fn = self._get_function(fnty, name="PySys_FormatStdout")
+        else:
+            fn = self._get_function(fnty, name="PySys_WriteStdout")
         return self.builder.call(fn, (fmt,) + args)
 
     def object_dump(self, obj):
@@ -1263,6 +1266,32 @@ class PythonAPI(object):
         fn.args[1].add_attribute(lc.ATTR_NO_CAPTURE)
         fn.return_value.add_attribute("noalias")
         return self.builder.call(fn, [data, pyobj])
+
+    def nrt_meminfo_as_pyobject(self, miptr):
+        mod = self.builder.module
+        fnty = ir.FunctionType(
+            self.pyobj,
+            [cgutils.voidptr_t]
+        )
+        fn = mod.get_or_insert_function(
+            fnty,
+            name='NRT_meminfo_as_pyobject',
+        )
+        fn.return_value.add_attribute("noalias")
+        return self.builder.call(fn, [miptr])
+
+    def nrt_meminfo_from_pyobject(self, miobj):
+        mod = self.builder.module
+        fnty = ir.FunctionType(
+            cgutils.voidptr_t,
+            [self.pyobj]
+        )
+        fn = mod.get_or_insert_function(
+            fnty,
+            name='NRT_meminfo_from_pyobject',
+        )
+        fn.return_value.add_attribute("noalias")
+        return self.builder.call(fn, [miobj])
 
     def nrt_adapt_ndarray_from_python(self, ary, ptr):
         assert self.context.enable_nrt
