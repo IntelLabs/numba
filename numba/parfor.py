@@ -32,6 +32,7 @@ from numba.typing.templates import infer_global, AbstractTemplate
 from numba import stencilparfor
 from numba.stencilparfor import StencilPass
 from numba.extending import register_jitable
+import numbers
 
 
 from numba.ir_utils import (
@@ -1281,6 +1282,7 @@ class PreParforPass(object):
         if self.options.numpy:
             self._replace_parallel_functions(self.func_ir.blocks)
         self.func_ir.blocks = simplify_CFG(self.func_ir.blocks)
+        dprint_func_ir(self.func_ir, "after PreParforPass")
 
     def _replace_parallel_functions(self, blocks):
         """
@@ -1433,6 +1435,11 @@ class ParforPass(object):
         # run array analysis, a pre-requisite for parfor translation
         remove_dels(self.func_ir.blocks)
         self.array_analysis.run(self.func_ir.blocks)
+
+        if not self.flags.pa_outlined_kernel:
+            if generate_aliasing_variants(self.func_ir, self.typemap, self.calltypes, self.array_analysis, self.typingctx):
+                self.array_analysis.run(self.func_ir.blocks)
+
         # run stencil translation to parfor
         if self.options.stencil:
             stencil_pass = StencilPass(self.func_ir, self.typemap, self.calltypes,
@@ -3162,6 +3169,237 @@ def parfor_insert_dels(parfor, curr_dead_set):
 
 postproc.ir_extension_insert_dels[Parfor] = parfor_insert_dels
 
+def find_args_written_to(block, arg_aliases):
+    """
+    Scan all the blocks to find arrays written to.
+    """
+    print("array_analysis:", array_analysis, type(array_analysis))
+    for stmt in block.body:
+        if isinstance(stmt, ir.Assign):
+            if isinstance(stmt.value, ir.Expr):
+                print("assign val:", stmt.value, type(stmt.value), stmt.value.op, stmt.value._kws)
+        if isinstance(stmt, ir.StaticSetItem) or isinstance(stmt, ir.SetItem):
+            if stmt.target.name in arg_aliases:
+                print("Found argument alias written to for array", stmt.target.name)
+                return True
+    return False
+
+def duplicate_stmt(x, typemap, calltypes, dup_typemap, dup_calltypes, label_offset):
+    xtyp = type(x)
+    print("duplicate_stmt:", x, xtyp, type(xtyp))
+    if isinstance(x, ir.Var):
+        new_lhs_name = "duplicate_" + x.name
+        assert(new_lhs_name not in typemap)
+        dup_typemap[new_lhs_name] = typemap[x.name]
+        to_return = ir.Var(x.scope, new_lhs_name, x.loc)
+    elif isinstance(x, ir.Arg):
+        to_return = copy.copy(x)
+    elif isinstance(x, ir.Assign):
+        to_return = ir.Assign(duplicate_stmt(x.value, typemap, calltypes, dup_typemap, dup_calltypes, label_offset),
+                         duplicate_stmt(x.target, typemap, calltypes, dup_typemap, dup_calltypes, label_offset),
+                         x.loc)
+    elif isinstance(x, ir.Expr):
+        print("duplicate_stmt expr:", type(x._kws), x._kws)
+        to_return = ir.Expr(x.op, x.loc, **{key:duplicate_stmt(value, typemap, calltypes, dup_typemap, dup_calltypes, label_offset) for (key,value) in x._kws.items()})
+    elif isinstance(x, str):
+        to_return = copy.copy(x)
+    elif isinstance(x, numbers.Number):
+        to_return = copy.copy(x)
+    elif x == None:
+        to_return = None
+    elif isinstance(x, ir.Const):
+        to_return = copy.copy(x)
+    elif isinstance(x, ir.Global):
+        to_return = copy.deepcopy(x)
+    elif isinstance(x, list):
+        to_return = [duplicate_stmt(y, typemap, calltypes, dup_typemap, dup_calltypes, label_offset) for y in x]
+    elif isinstance(x, dict):
+        to_return = {duplicate_stmt(key, typemap, calltypes, dup_typemap, dup_calltypes, label_offset):duplicate_stmt(value, typemap, calltypes, dup_typemap, dup_calltypes, label_offset) for (key,value) in x.items()}
+    elif isinstance(x, tuple):
+        to_return = tuple(duplicate_stmt(y, typemap, calltypes, dup_typemap, dup_calltypes, label_offset) for y in x)
+    elif isinstance(type(x), numba.types.abstract._TypeMetaclass):
+        to_return = x
+    elif isinstance(x, ir.StaticSetItem):
+        to_return = ir.StaticSetItem(
+                   duplicate_stmt(x.target, typemap, calltypes, dup_typemap, dup_calltypes, label_offset),
+                   duplicate_stmt(x.index, typemap, calltypes, dup_typemap, dup_calltypes, label_offset),
+                   duplicate_stmt(x.index_var, typemap, calltypes, dup_typemap, dup_calltypes, label_offset),
+                   duplicate_stmt(x.value, typemap, calltypes, dup_typemap, dup_calltypes, label_offset),
+                   x.loc)
+    elif isinstance(x, slice):
+        to_return = slice(
+                   duplicate_stmt(x.start, typemap, calltypes, dup_typemap, dup_calltypes, label_offset),
+                   duplicate_stmt(x.stop, typemap, calltypes, dup_typemap, dup_calltypes, label_offset),
+                   duplicate_stmt(x.step, typemap, calltypes, dup_typemap, dup_calltypes, label_offset))
+    elif isinstance(x, ir.Return):
+        to_return = ir.Return(duplicate_stmt(x.value, typemap, calltypes, dup_typemap, dup_calltypes, label_offset), x.loc)
+    elif isinstance(x, ir.Jump):
+        to_return = ir.Jump(x.target + label_offset, x.loc)
+    elif isinstance(x, ir.Branch):
+        to_return = ir.Branch(duplicate_stmt(x.cond, typemap, calltypes, dup_typemap, dup_calltypes, label_offset), x.truebr + label_offset, x.falsebr + label_offset, x.loc)
+    else:
+        class_name = x.__class__.__name__
+        print("class_name:", class_name)
+        if class_name == 'builtin_function_or_method':
+            to_return = x
+        else:
+            print("Unhandled type:", type(x))
+            assert(0)
+
+    try:
+        if x in calltypes:
+            print("Duplicating calltype for", to_return, calltypes[x])
+            dup_calltypes[to_return] = calltypes[x]
+    except:
+        pass
+
+    return to_return
+
+def duplicate_code(blocks, typemap, calltypes, arg_names, typingctx):
+    """ To duplicate the code, we created a new starting block where we
+        will do the alias check.  Then, the block of code is always wrapped
+        in two new blocks.  The first new block precedes that code and at
+        this point just jumps to the code.  This gives us a spot to put
+        additional code but that may prove unnecessary and this preceding
+        block could be eliminated.  After the block of code, we generate a
+        new block that just returns None in case the previous code happens
+        to fallthrough.  Likewise, once the original code is duplicated it
+        to is wrapped by the same blocks.  If any of these blocks are not
+        needed then simplify_CFG will remove them.
+    """
+    new_blocks = {}
+    min_block_label = min(blocks.keys())
+    min_block = blocks[min_block_label]
+    max_block = max(blocks.keys())
+    start_block = 0
+    start_alias_block = 1
+    alias_offset = 2
+    end_alias_block = max_block + 3
+    start_noalias_block = max_block + 4
+    noalias_offset = max_block + 5
+    end_noalias_block = (2 * max_block) + 6
+
+    fake = True
+
+    # Create the new start block.
+    new_blocks[start_block] = ir.Block(min_block.scope, min_block.loc)
+
+    if fake:
+        first_array_name = ""
+        first_array_val = 0
+        for an in arg_names:
+            if isinstance(typemap[an], types.npytypes.Array):
+                first_array_name = an
+                break
+            else:
+                first_array_val += 1
+        assert(first_array_name != "")
+        print("first_array_name:", first_array_name)
+
+        # Add a "var = arg(N, arg_name)" for each input array we'll need to look at.
+        first_array_var = ir.Var(min_block.scope, mk_unique_var("$duplicate_first_block_array"), min_block.loc)
+        typemap[first_array_var.name] = typemap[first_array_name]
+        first_array_assign = ir.Assign(ir.Arg(first_array_name, first_array_val, min_block.loc), first_array_var, min_block.loc)
+        new_blocks[start_block].body.append(first_array_assign)
+
+        # Adding a fake condition to check until true aliasing checking is working.
+        ndim_var = ir.Var(min_block.scope, mk_unique_var("$duplicate_first_block_array_ndim"), min_block.loc)
+        typemap[ndim_var.name] = types.intp
+        ndim_assign = ir.Assign(ir.Expr.getattr(first_array_var, 'ndim', min_block.loc), ndim_var, min_block.loc)
+        new_blocks[start_block].body.append(ndim_assign)
+
+        const0_var = ir.Var(min_block.scope, mk_unique_var("$duplicate_first_block_array_const0"), min_block.loc)
+        typemap[const0_var.name] = types.intp
+        const0_assign = ir.Assign(ir.Const(0, min_block.loc), const0_var, min_block.loc)
+        new_blocks[start_block].body.append(const0_assign)
+
+        # Implement a fake check of array.ndim versus 0.
+        ne_res_var = ir.Var(min_block.scope, mk_unique_var("$duplicate_first_block_array_ne_res"), min_block.loc)
+        typemap[ne_res_var.name] = types.boolean
+        ne_binop = ir.Expr.binop(operator.ne, ndim_var, const0_var, min_block.loc)
+        calltypes[ne_binop] = typingctx.resolve_function_type(operator.ne, (types.intp, types.intp), {})
+        ne_var_assign = ir.Assign(ne_binop, ne_res_var, min_block.loc)
+        new_blocks[start_block].body.append(ne_var_assign)
+
+        new_blocks[start_block].body.append(ir.Branch(ne_res_var, start_alias_block, start_noalias_block, min_block.loc))
+    else:
+        pass
+
+    # Create the predecessor and successor blocks for where aliasing is detected.
+    new_blocks[start_alias_block] = ir.Block(min_block.scope, min_block.loc)
+    new_blocks[start_alias_block].body.append(ir.Jump(min_block_label + alias_offset, min_block.loc))
+    new_blocks[end_alias_block] = ir.Block(min_block.scope, min_block.loc)
+    new_blocks[end_alias_block].body.append(ir.Return(None, min_block.loc))
+
+    # Create the predecessor and successor blocks for where no aliasing is detected.
+    new_blocks[start_noalias_block] = ir.Block(min_block.scope, min_block.loc)
+    new_blocks[start_noalias_block].body.append(ir.Jump(min_block_label + noalias_offset, min_block.loc))
+    new_blocks[end_noalias_block] = ir.Block(min_block.scope, min_block.loc)
+    new_blocks[end_noalias_block].body.append(ir.Return(None, min_block.loc))
+
+    dup_typemap = {}
+    dup_calltypes = {}
+
+    # Go through all the original blocks.
+    for k,v in blocks.items():
+        # Create a new block for aliased code.
+        new_orig_block = ir.Block(v.scope, v.loc)
+        # Create a new block for non-aliased code.
+        block_copy = ir.Block(v.scope, v.loc)
+        # For each statement in the current block...
+        for stmt in v.body:
+            # We most use the original code for the aliased case.  The only thing we have to change
+            # is the branch and jump labels.
+            if isinstance(stmt, ir.Jump):
+                new_orig_block.body.append(ir.Jump(stmt.target + alias_offset, stmt.loc))
+            elif isinstance(stmt, ir.Branch):
+                new_orig_block.body.append(ir.Branch(stmt.cond, stmt.truebr + alias_offset, stmt.falsebr + alias_offset, stmt.loc))
+            else:
+                # Add the original statement unmodified to the new aliased code block.
+                new_orig_block.body.append(stmt)
+
+            # Add the statement to the non-aliased code block.  Have to recursively replace all variables
+            # and update jump and branch labels.
+            block_copy.body.append(duplicate_stmt(stmt, typemap, calltypes, dup_typemap, dup_calltypes, noalias_offset))
+        new_blocks[k + alias_offset] = new_orig_block
+        new_blocks[k + noalias_offset] = block_copy
+
+    print("dup_typemap:", dup_typemap)
+    typemap.update(dup_typemap)
+    calltypes.update(dup_calltypes)
+
+    return new_blocks
+
+def generate_aliasing_variants(func_ir, typemap, calltypes, array_analysis, typingctx):
+    """
+    If an array argument is written to then it may alias any of the other array arguments.
+    If so, check for aliasing dynamically and create two variants, one for aliasing and one without.
+    """
+    print("generate_aliasing_variants")
+    blocks = func_ir.blocks
+    alias_map, arg_aliases = find_potential_aliases(blocks, func_ir.arg_names, typemap, func_ir)
+    print("alias_map:", alias_map)
+    print("arg_aliases:", arg_aliases)
+
+    args_written_to = False
+    for block in blocks.values():
+        args_written_to = find_args_written_to(block, arg_aliases)
+        if args_written_to:
+            break
+    print("args_written_to:", args_written_to)
+
+    if args_written_to:
+        """ If we found some input array or some alias thereof written into by this function
+            then generate code to check potential aliasing at runtime.
+        """
+        dprint_func_ir(func_ir, "before alias duplication")
+        func_ir.blocks = duplicate_code(blocks, typemap, calltypes, func_ir.arg_names, typingctx)
+        dprint_func_ir(func_ir, "after alias duplication")
+        func_ir.blocks = simplify_CFG(func_ir.blocks)
+        dprint_func_ir(func_ir, "after simplify")
+        return True
+    else:
+        return False
 
 def maximize_fusion(func_ir, blocks, typemap, up_direction=True):
     """
