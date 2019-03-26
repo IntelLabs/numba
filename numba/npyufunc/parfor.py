@@ -1068,6 +1068,7 @@ def _create_gufunc_for_parfor_body(
         print("typemap", typemap)
 
     old_alias = flags.noalias
+    flags.pa_outlined_kernel = True
     if not has_aliases:
         if config.DEBUG_ARRAY_OPT:
             print("No aliases found so adding noalias flag.")
@@ -1082,6 +1083,7 @@ def _create_gufunc_for_parfor_body(
         locals)
 
     flags.noalias = old_alias
+    flags.pa_outlined_kernel = False
 
     kernel_sig = signature(types.none, *gufunc_param_types)
     if config.DEBUG_ARRAY_OPT:
