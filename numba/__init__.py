@@ -16,7 +16,7 @@ from . import config, errors, _runtests as runtests, types
 
 # Re-export typeof
 from .special import (
-    typeof, prange, pndindex, gdb, gdb_breakpoint, gdb_init,
+    typeof, prange, pndindex, gdb, gdb_breakpoint, gdb_init, preduce,
     literally
 )
 

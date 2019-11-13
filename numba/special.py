@@ -19,6 +19,8 @@ class prange(object):
     def __new__(cls, *args):
         return range(*args)
 
+def preduce(reduce_func, red_var, to_combine):
+    return reduce_func(red_var, to_combine)
 
 def _gdb_python_call_gen(func_name, *args):
     # generates a call to a function containing a compiled in gdb command,
@@ -92,6 +94,7 @@ __all__ = [
     'typeof',
     'prange',
     'pndindex',
+    'preduce',
     'gdb',
     'gdb_breakpoint',
     'gdb_init',

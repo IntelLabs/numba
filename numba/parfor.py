@@ -26,7 +26,7 @@ from contextlib import contextmanager
 import operator
 
 import numba
-from numba import ir, ir_utils, types, typing, rewrites, config, analysis, prange, pndindex
+from numba import ir, ir_utils, types, typing, rewrites, config, analysis, prange, pndindex, preduce
 from numba import array_analysis, postproc, typeinfer, utils, errors
 from numba.numpy_support import as_dtype
 from numba.typing.templates import infer_global, AbstractTemplate
@@ -118,6 +118,13 @@ class internal_prange(object):
 
     def __new__(cls, *args):
         return range(*args)
+
+@overload(preduce)
+def preduce_overload():
+    print("preduce_overload")
+    def preduce_impl(func, arg1, arg2):
+        return func(arg1, arg2)
+    return preduce_impl
 
 def min_parallel_impl(return_type, arg):
     # XXX: use prange for 1D arrays since pndindex returns a 1-tuple instead of
@@ -3007,12 +3014,16 @@ def get_reduction_init(nodes):
     return None, None
 
 def supported_reduction(x, func_ir):
+    print("supported_reduction:", x, type(x))
     if x.op == 'inplace_binop' or x.op == 'binop':
-        return True
+        return x.op
     if x.op == 'call':
         callname = guard(find_callname, func_ir, x)
-        if callname == ('max', 'builtins') or callname == ('min', 'builtins'):
-            return True
+        print("callname:", callname)
+        if (callname == ('max', 'builtins') or
+            callname == ('min', 'builtins') or
+            callname == ('preduce', 'numba')):
+            return callname
     return False
 
 def get_reduce_nodes(name, nodes, func_ir):
@@ -3031,12 +3042,15 @@ def get_reduce_nodes(name, nodes, func_ir):
         else:
             return var if (varonly or val == None) else val
 
+    print("get_reduce_nodes:", name)
     for i, stmt in enumerate(nodes):
         lhs = stmt.target
         rhs = stmt.value
         defs[lhs.name] = rhs
+        print("i,stmt:", i, stmt, lhs, rhs, type(rhs))
         if isinstance(rhs, ir.Var) and rhs.name in defs:
             rhs = lookup(rhs)
+            print("updated rhs:", rhs, type(rhs))
         if isinstance(rhs, ir.Expr):
             in_vars = set(lookup(v, True).name for v in rhs.list_vars())
             if name in in_vars:
@@ -3046,18 +3060,31 @@ def get_reduce_nodes(name, nodes, func_ir):
                                       " other than in a supported reduction"
                                       " function is not permitted."))
 
-                if not supported_reduction(rhs, func_ir):
+                supported_reduction_kind = supported_reduction(rhs, func_ir)
+                if not supported_reduction_kind:
                     raise ValueError(("Use of reduction variable " + name +
                                       " in an unsupported reduction function."))
+                print("rhs expr args:", get_expr_args(rhs))
                 args = [ (x.name, lookup(x, True)) for x in get_expr_args(rhs) ]
+                print("args:", args)
                 non_red_args = [ x for (x, y) in args if y.name != name ]
-                assert len(non_red_args) == 1
-                args = [ (x, y) for (x, y) in args if x != y.name ]
-                replace_dict = dict(args)
-                replace_dict[non_red_args[0]] = ir.Var(lhs.scope, name+"#init", lhs.loc)
-                replace_vars_inner(rhs, replace_dict)
-                reduce_nodes = nodes[i:]
-                break;
+                print("non_red_args:", non_red_args)
+                if supported_reduction_kind == ('preduce', 'numba'):
+                    assert len(non_red_args) == 2
+                    args = [ (x, y) for (x, y) in args if x != y.name ]
+                    replace_dict = dict(args)
+                    replace_dict[non_red_args[0]] = ir.Var(lhs.scope, name+"#init", lhs.loc)
+                    replace_vars_inner(rhs, replace_dict)
+                    reduce_nodes = nodes[i:]
+                    break;
+                else:
+                    assert len(non_red_args) == 1
+                    args = [ (x, y) for (x, y) in args if x != y.name ]
+                    replace_dict = dict(args)
+                    replace_dict[non_red_args[0]] = ir.Var(lhs.scope, name+"#init", lhs.loc)
+                    replace_vars_inner(rhs, replace_dict)
+                    reduce_nodes = nodes[i:]
+                    break;
     assert reduce_nodes, "Invalid reduction format"
     return reduce_nodes
 

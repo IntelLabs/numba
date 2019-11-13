@@ -5,7 +5,7 @@ import itertools
 import numpy as np
 import operator
 
-from numba import types, prange, errors
+from numba import types, prange, errors, preduce
 from numba.parfor import internal_prange
 
 from numba.utils import PYVERSION, RANGE_ITER_OBJECTS, IS_PY3
@@ -79,6 +79,13 @@ for func in RANGE_ITER_OBJECTS:
 
 infer_global(prange, typing_key=prange)(Range)
 infer_global(internal_prange, typing_key=internal_prange)(Range)
+
+@infer_global(preduce)
+class PreduceTyping(AbstractTemplate):
+    def generic(self, args, kws):
+        [func, lhs, rhs] = args
+        if lhs == rhs:
+            return signature(lhs, *args)
 
 @infer
 class GetIter(AbstractTemplate):
