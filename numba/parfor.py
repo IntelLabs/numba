@@ -120,7 +120,7 @@ class internal_prange(object):
         return range(*args)
 
 @overload(preduce)
-def preduce_overload():
+def preduce_overload(func, arg1, arg2):
     print("preduce_overload")
     def preduce_impl(func, arg1, arg2):
         return func(arg1, arg2)
@@ -3073,7 +3073,7 @@ def get_reduce_nodes(name, nodes, func_ir):
                     assert len(non_red_args) == 2
                     args = [ (x, y) for (x, y) in args if x != y.name ]
                     replace_dict = dict(args)
-                    replace_dict[non_red_args[0]] = ir.Var(lhs.scope, name+"#init", lhs.loc)
+                    replace_dict[non_red_args[1]] = ir.Var(lhs.scope, name+"#init", lhs.loc)
                     replace_vars_inner(rhs, replace_dict)
                     reduce_nodes = nodes[i:]
                     break;

@@ -352,14 +352,14 @@ def _lower_parfor_parallel(lowerer, parfor):
                                                              typemap[index_var.name],
                                                              typemap[oneelem.name],
                                                              typemap[init_var.name])
-                    print("res_print", res_print)
+                    print("one_res_print", res_print)
                     lowerer.lower_inst(res_print)
 
                 # generate code for combining reduction variable with thread output
                 for inst in parfor_reddict[name][1]:
                     # If we have a case where a parfor body has an array reduction like A += B
                     # and A and B have different data types then the reduction in the parallel
-                    # region will operate on those differeing types.  However, here, after the
+                    # region will operate on those differing types.  However, here, after the
                     # parallel region, we are summing across the reduction array and that is
                     # guaranteed to have the same data type so we need to change the reduction
                     # nodes so that the right-hand sides have a type equal to the reduction-type
