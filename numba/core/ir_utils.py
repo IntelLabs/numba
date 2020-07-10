@@ -155,7 +155,7 @@ def mk_range_block(typemap, start, stop, step, calltypes, scope, loc):
         typing.Context(), [types.intp] * len(args), {})
     #signature(types.range_state64_type, types.intp)
     range_call_var = ir.Var(scope, mk_unique_var("$range_c_var"), loc)
-    typemap[range_call_var.name] = types.iterators.RangeType(types.intp)
+    typemap[range_call_var.name] = types.iterators.RangeType(types.intp, True)
     range_call_assign = ir.Assign(range_call, range_call_var, loc)
     # iter_var = getiter(range_call_var)
     iter_call = ir.Expr.getiter(range_call_var, loc)

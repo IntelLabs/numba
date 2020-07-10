@@ -4,17 +4,19 @@ from ..errors import TypingError
 
 class RangeType(SimpleIterableType):
 
-    def __init__(self, dtype):
+    def __init__(self, dtype, non0step):
         self.dtype = dtype
-        name = "range_state_%s" % (dtype,)
+        self.non0step = non0step
+        name = "range_state_%s%s" % (dtype, "_non0step" if non0step else "")
         super(SimpleIterableType, self).__init__(name)
         self._iterator_type = RangeIteratorType(self.dtype)
 
     def unify(self, typingctx, other):
         if isinstance(other, RangeType):
             dtype = typingctx.unify_pairs(self.dtype, other.dtype)
+            unified_non0step = self.non0step and other.non0step
             if dtype is not None:
-                return RangeType(dtype)
+                return RangeType(dtype, unified_non0step)
 
 
 class RangeIteratorType(SimpleIteratorType):

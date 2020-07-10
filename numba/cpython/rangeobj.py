@@ -24,8 +24,9 @@ def make_range_iterator(typ):
     return cgutils.create_struct_proxy(typ)
 
 
-def make_range_impl(int_type, range_state_type, range_iter_type):
+def make_range_impl(int_type, range_state_type, range_state_non0step_type, range_iter_type):
     RangeState = cgutils.create_struct_proxy(range_state_type)
+    RangeState_non0step = cgutils.create_struct_proxy(range_state_non0step_type)
 
     @lower_builtin(range, int_type)
     @lower_builtin(prange, int_type)
@@ -35,13 +36,13 @@ def make_range_impl(int_type, range_state_type, range_iter_type):
         range(stop: int) -> range object
         """
         [stop] = args
-        state = RangeState(context, builder)
+        state = RangeState_non0step(context, builder)
         state.start = context.get_constant(int_type, 0)
         state.stop = stop
         state.step = context.get_constant(int_type, 1)
         return impl_ret_untracked(context,
                                   builder,
-                                  range_state_type,
+                                  range_state_non0step_type,
                                   state._getvalue())
 
     @lower_builtin(range, int_type, int_type)
@@ -52,13 +53,13 @@ def make_range_impl(int_type, range_state_type, range_iter_type):
         range(start: int, stop: int) -> range object
         """
         start, stop = args
-        state = RangeState(context, builder)
+        state = RangeState_non0step(context, builder)
         state.start = start
         state.stop = stop
         state.step = context.get_constant(int_type, 1)
         return impl_ret_untracked(context,
                                   builder,
-                                  range_state_type,
+                                  range_state_non0step_type,
                                   state._getvalue())
 
     @lower_builtin(range, int_type, int_type, int_type)
@@ -79,30 +80,34 @@ def make_range_impl(int_type, range_state_type, range_iter_type):
                                   state._getvalue())
 
     @lower_builtin(len, range_state_type)
+    @lower_builtin(len, range_state_non0step_type)
     def range_len(context, builder, sig, args):
         """
         len(range)
         """
         (value,) = args
+        (t1arg,) = sig.args
         state = RangeState(context, builder, value)
-        res = RangeIter.from_range_state(context, builder, state)
+        res = RangeIter.from_range_state(context, builder, state, t1arg)
         return impl_ret_untracked(context, builder, int_type, builder.load(res.count))
 
     @lower_builtin('getiter', range_state_type)
+    @lower_builtin('getiter', range_state_non0step_type)
     def getiter_range32_impl(context, builder, sig, args):
         """
         range.__iter__
         """
         (value,) = args
+        (t1arg,) = sig.args
         state = RangeState(context, builder, value)
-        res = RangeIter.from_range_state(context, builder, state)._getvalue()
+        res = RangeIter.from_range_state(context, builder, state, t1arg)._getvalue()
         return impl_ret_untracked(context, builder, range_iter_type, res)
 
     @iterator_impl(range_state_type, range_iter_type)
     class RangeIter(make_range_iterator(range_iter_type)):
 
         @classmethod
-        def from_range_state(cls, context, builder, state):
+        def from_range_state(cls, context, builder, state, range_type):
             """
             Create a RangeIter initialized from the given RangeState *state*.
             """
@@ -127,12 +132,17 @@ def make_range_impl(int_type, range_state_type, range_iter_type):
             pos_diff = builder.icmp(lc.ICMP_SGT, diff, zero)
             pos_step = builder.icmp(lc.ICMP_SGT, step, zero)
             sign_differs = builder.xor(pos_diff, pos_step)
-            zero_step = builder.icmp(lc.ICMP_EQ, step, zero)
 
-            with cgutils.if_unlikely(builder, zero_step):
-                # step shouldn't be zero
-                context.call_conv.return_user_exc(builder, ValueError,
-                                                  ("range() arg 3 must not be zero",))
+            if not range_type.non0step:
+                zero_step = builder.icmp(lc.ICMP_EQ, step, zero)
+
+                with cgutils.if_unlikely(builder, zero_step):
+                    # step shouldn't be zero
+                    context.call_conv.return_user_exc(
+                        builder,
+                        ValueError,
+                        ("range() arg 3 must not be zero",)
+                    )
 
             with builder.if_else(sign_differs) as (then, orelse):
                 with then:
@@ -165,9 +175,15 @@ def make_range_impl(int_type, range_state_type, range_iter_type):
 
 
 range_impl_map = {
-    types.int32 : (types.range_state32_type, types.range_iter32_type),
-    types.int64 : (types.range_state64_type, types.range_iter64_type),
-    types.uint64 : (types.unsigned_range_state64_type, types.unsigned_range_iter64_type)
+    types.int32 : (types.range_state32_type,
+                   types.range_state32_non0step_type,
+                   types.range_iter32_type),
+    types.int64 : (types.range_state64_type,
+                   types.range_state64_non0step_type,
+                   types.range_iter64_type),
+    types.uint64 : (types.unsigned_range_state64_type,
+                    types.unsigned_range_state64_non0step_type,
+                    types.unsigned_range_iter64_type)
 }
 
 for int_type, state_types in range_impl_map.items():
