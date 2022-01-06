@@ -30,6 +30,7 @@ from numba.core.extending import intrinsic, register_jitable
 import llvmlite.llvmpy.core as lc
 import llvmlite
 from numba.np.unsafe.ndarray import to_fixed_tuple
+import types as ptypes
 
 UNKNOWN_CLASS = -1
 CONST_CLASS = 0
@@ -1222,7 +1223,7 @@ class ArrayAnalysis(object):
         # calculate beginning equiv_set of current block as an intersection
         # of incoming ones.
         if config.DEBUG_ARRAY_OPT >= 2:
-            print("preds:", preds)
+            print("preds:", preds, label)
         for (p, q) in preds:
             if config.DEBUG_ARRAY_OPT >= 2:
                 print("p, q:", p, q)
@@ -1290,11 +1291,44 @@ class ArrayAnalysis(object):
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
+    def _unversion(self, node):
+        if isinstance(node, ir.Assign):
+            assert(isinstance(node.target, ir.Var))
+            return ir.Assign(self._unversion(node.value),
+                             self._unversion(node.target),
+                             node.loc)
+        elif isinstance(node, ir.Var):
+            return ir.Var(node.scope, node.unversioned_name, node.loc)
+        elif isinstance(node, ir.Expr):
+            return ir.Expr(node.op, node.loc, **self._unversion(node._kws))
+        elif isinstance(node, ir.Branch):
+            return ir.Branch(self._unversion(node.cond), node.truebr, node.falsebr, node.loc)
+        elif isinstance(node, ir.Return):
+            return ir.Return(self._unversion(node.value), node.loc)
+        elif isinstance(node, ir.SetItem):
+            return ir.SetItem(self._unversion(node.target), self._unversion(node.index), self._unversion(node.value), node.loc)
+        elif isinstance(node, ir.StaticSetItem):
+            return ir.StaticSetItem(self._unversion(node.target), self._unversion(node.index), self._unversion(node.index_var), self._unversion(node.value), node.loc)
+        elif isinstance(node, list):
+            return [self._unversion(x) for x in node]
+        elif isinstance(node, tuple):
+            return tuple([self._unversion(x) for x in node])
+        elif isinstance(node, dict):
+             return {k:self._unversion(v) for k,v in node.items()}
+        elif node is None:
+            return node
+        elif isinstance(node, (ir.Arg, ir.Global, ir.Const, ir.Jump, ptypes.BuiltinFunctionType, ir.UndefinedType, types.npytypes.Array, str)):
+            return node
+        else:
+            print(type(node))
+            assert(False)
+
     def _analyze_inst(self, label, scope, equiv_set, inst, redefined):
         pre = []
         post = []
         if config.DEBUG_ARRAY_OPT >= 2:
             print("analyze_inst:", inst)
+        inst = self._unversion(inst)
         if isinstance(inst, ir.Assign):
             lhs = inst.target
             typ = self.typemap[lhs.name]
@@ -2959,14 +2993,9 @@ class ArrayAnalysis(object):
             ir.Assign(value=func_def, target=func_var, loc=loc)
         )
         func_fnty = get_global_func_typ(runtime_broadcast_assert_shapes)
-        print("func_fnty:", func_fnty)
         self.typemap[func_var.name] = func_fnty
         fargs = [types.literal(max_dim)] + typs
-        print("typs:", typs)
-        print("dims:", dims, max_dim)
-        print("fargs:", fargs)
         func_sig = self.context.resolve_function_type(func_fnty, fargs, {})
-        print("func_sig:", func_sig)
 
         max_dim_var = ir.Var(scope, mk_unique_var("max_dim"), loc)
         max_dim_val = ir.Const(max_dim, loc)
@@ -3034,14 +3063,25 @@ class ArrayAnalysis(object):
                 shape=arrs[0],
                 pre=self._call_assert_equiv(scope, loc, equiv_set, arrs)
             )
-        if None not in shapes:
-            return self._broadcast_assert_shapes(
-                scope, equiv_set, loc, shapes, names
-            )
+        post = []
+        if None in shapes:
+            new_shapes = []
+            for ashape, arr in zip(shapes, arrs):
+                if not ashape:
+                    new_shapes.append(self._gen_shape_call(equiv_set, arr, self.typemap[arr.name].ndim, None, post))
+                else:
+                    new_shapes.append(ashape)
+            shapes = new_shapes
+
+        bas_res = self._broadcast_assert_shapes(
+            scope, equiv_set, loc, shapes, names
+        )
+        if "pre" in bas_res.kwargs:
+            bas_res.kwargs["pre"] = post + bas_res.kwargs["pre"]
         else:
-            return self._insert_runtime_broadcast_call(
-                scope, loc, arrs, max_dim
-            )
+            bas_res.kwargs["pre"] = post
+
+        return bas_res
 
     def _broadcast_assert_shapes(self, scope, equiv_set, loc, shapes, names):
         """Produce assert_equiv for sizes in each dimension, taking into
