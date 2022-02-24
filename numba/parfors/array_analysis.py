@@ -226,6 +226,18 @@ class EquivSet(object):
         # relation is created.
         self.next_ind = next_ind
 
+    def __ne__(self, other):
+        return not (self == other)
+
+    def __eq__(self, other):
+        if len(self.obj_to_ind) != len(other.obj_to_ind):
+            print("obj_to_ind differ:", self.obj_to_ind, other.obj_to_ind)
+            return False
+        if len(self.ind_to_obj) != len(other.ind_to_obj):
+            print("ind_to_obj differ:", self.ind_to_obj, other.ind_to_obj)
+            return False
+        return True
+
     def empty(self):
         """Return an empty EquivSet object.
         """
@@ -241,7 +253,7 @@ class EquivSet(object):
         )
 
     def __repr__(self):
-        return "EquivSet({})".format(self.ind_to_obj)
+        return "EquivSet(ind_to_obj={}, obj_to_ind={})".format(self.ind_to_obj, self.obj_to_ind)
 
     def is_empty(self):
         """Return true if the set is empty, or false otherwise.
@@ -396,6 +408,21 @@ class ShapeEquivSet(EquivSet):
 
         super(ShapeEquivSet, self).__init__(obj_to_ind, ind_to_obj, next_id)
 
+    def __ne__(self, other):
+        return not (self == other)
+
+    def __eq__(self, other):
+        if len(self.defs) != len(other.defs):
+            print("defs differ:", self.defs, other.defs)
+            return False
+        if len(self.ind_to_var) != len(other.ind_to_var):
+            print("ind_to_var differ:", self.ind_to_var, other.ind_to_var)
+            return False
+        if len(self.ind_to_const) != len(other.ind_to_const):
+            print("ind_to_const differ:", self.ind_to_const, other.ind_to_const)
+            return False
+        return super(ShapeEquivSet, self).__eq__(other)
+
     def empty(self):
         """Return an empty ShapeEquivSet.
         """
@@ -415,8 +442,11 @@ class ShapeEquivSet(EquivSet):
         )
 
     def __repr__(self):
-        return "ShapeEquivSet({}, ind_to_var={}, ind_to_const={})".format(
-            self.ind_to_obj, self.ind_to_var, self.ind_to_const
+        return "ShapeEquivSet(ind_to_obj={}, obj_to_ind={}, ind_to_var={}, ind_to_const={})".format(
+            self.ind_to_obj,
+            self.obj_to_ind,
+            self.ind_to_var,
+            self.ind_to_const
         )
 
     def _get_names(self, obj):
@@ -787,6 +817,27 @@ class SymbolicEquivSet(ShapeEquivSet):
             typemap, defs, ind_to_var, obj_to_ind, ind_to_obj, next_id
         )
 
+    def __ne__(self, other):
+        return not (self == other)
+
+    def __eq__(self, other):
+        if len(self.def_by) != len(other.def_by):
+            print("def_by differ:", self.def_by, other.def_by)
+            return False
+        if len(self.ref_by) != len(other.ref_by):
+            print("ref_by differ:", self.ref_by, other.ref_by)
+            return False
+        if len(self.ext_shapes) != len(other.ext_shapes):
+            print("ext_shapes differ:", self.ext_shapes, other.ext_shapes)
+            return False
+        if len(self.rel_map) != len(other.rel_map):
+            print("rel_map differ:", self.rel_map, other.rel_map)
+            return False
+        if len(self.wrap_map) != len(other.wrap_map):
+            print("wrap_map differ:", self.wrap_map, other.wrap_map)
+            return False
+        return super(SymbolicEquivSet, self).__eq__(other)
+
     def empty(self):
         """Return an empty SymbolicEquivSet.
         """
@@ -794,9 +845,10 @@ class SymbolicEquivSet(ShapeEquivSet):
 
     def __repr__(self):
         return (
-            "SymbolicEquivSet({}, ind_to_var={}, def_by={}, "
-            "ref_by={}, ext_shapes={})".format(
+            "SymbolicEquivSet(ind_to_obj={}, obj_to_ind={}, ind_to_var={}, "
+            "def_by={}, ref_by={}, ext_shapes={})".format(
                 self.ind_to_obj,
+                self.obj_to_ind,
                 self.ind_to_var,
                 self.def_by,
                 self.ref_by,
@@ -1168,8 +1220,9 @@ class ArrayAnalysis(object):
 
         cfg = compute_cfg_from_blocks(blocks)
         topo_order = find_topo_order(blocks, cfg=cfg)
+        has_loops = len(cfg.loops()) > 0
         # Traverse blocks in topological order
-        self._run_on_blocks(topo_order, blocks, cfg, init_equiv_set)
+        self._run_on_blocks(topo_order, blocks, cfg, init_equiv_set, has_loops)
 
         if config.DEBUG_ARRAY_OPT >= 1:
             self.dump()
@@ -1183,16 +1236,29 @@ class ArrayAnalysis(object):
         if config.DEBUG_ARRAY_OPT >= 1:
             print("Ending ArrayAnalysis:", aa_count_save)
 
-    def _run_on_blocks(self, topo_order, blocks, cfg, init_equiv_set):
-        for label in topo_order:
-            if config.DEBUG_ARRAY_OPT >= 2:
-                print("Processing block:", label)
-            block = blocks[label]
-            scope = block.scope
-            pending_transforms = self._determine_transform(
-                cfg, block, label, scope, init_equiv_set
-            )
-            self._combine_to_new_block(block, pending_transforms)
+    def _run_on_blocks(self, topo_order, blocks, cfg, init_equiv_set, has_loops):
+        converged = False
+        loop_count = 0
+        while not converged and has_loops:
+            print("run_on_blocks convergence loop", loop_count)
+            converged = True
+            for label in topo_order:
+                if config.DEBUG_ARRAY_OPT >= 2:
+                    print("Processing block:", label)
+                block = blocks[label]
+                scope = block.scope
+                pending_transforms, updated = self._determine_transform(
+                    cfg, block, label, scope, init_equiv_set
+                )
+                self._combine_to_new_block(block, pending_transforms)
+                print("converged:", loop_count, converged, updated)
+                converged = converged and not updated
+            self.func_ir.array_analysis_run = True
+            dprint_func_ir(self.func_ir, "end convergence loop", blocks)
+            loop_count += 1
+            if loop_count > 15:
+                import sys
+                sys.exit(-1)
 
     def _combine_to_new_block(self, block, pending_transforms):
         """Combine the new instructions from previous pass into a new block
@@ -1257,7 +1323,6 @@ class ArrayAnalysis(object):
         # Start with a new equiv_set if none is computed
         if equiv_set is None:
             equiv_set = init_equiv_set
-        self.equiv_sets[label] = equiv_set
 
         # Go through instructions in a block, and insert pre/post
         # instructions as we analyze them.
@@ -1273,7 +1338,15 @@ class ArrayAnalysis(object):
                 self.remove_redefineds(redefined)
 
             pending_transforms.append((inst, pre, post))
-        return pending_transforms
+
+        print("equiv_set before converge check:", equiv_set)
+        print("previous equiv_set before check:", None if label not in self.equiv_sets else self.equiv_sets[label])
+        if label not in self.equiv_sets or self.equiv_sets[label] != equiv_set:
+            self.equiv_sets[label] = equiv_set
+            return pending_transforms, True
+        else:
+            self.equiv_sets[label] = equiv_set
+            return pending_transforms, False
 
     def dump(self):
         """dump per-block equivalence sets for debugging purposes.
@@ -3034,14 +3107,29 @@ class ArrayAnalysis(object):
                 shape=arrs[0],
                 pre=self._call_assert_equiv(scope, loc, equiv_set, arrs)
             )
-        if None not in shapes:
-            return self._broadcast_assert_shapes(
-                scope, equiv_set, loc, shapes, names
-            )
+
+        post = []
+        if None in shapes:
+            new_shapes = []
+            for ashape, arr in zip(shapes, arrs):
+                if not ashape:
+                    new_shapes.append(self._gen_shape_call(equiv_set, arr, self.typemap[arr.name].ndim, None, post))
+                else:
+                    new_shapes.append(ashape)
+            shapes = new_shapes
+
+        if None in shapes:
+            return None
+
+        bas_res = self._broadcast_assert_shapes(
+            scope, equiv_set, loc, shapes, names
+        )
+        if "pre" in bas_res.kwargs:
+            bas_res.kwargs["pre"] = post + bas_res.kwargs["pre"]
         else:
-            return self._insert_runtime_broadcast_call(
-                scope, loc, arrs, max_dim
-            )
+            bas_res.kwargs["pre"] = post
+
+        return bas_res
 
     def _broadcast_assert_shapes(self, scope, equiv_set, loc, shapes, names):
         """Produce assert_equiv for sizes in each dimension, taking into
@@ -3149,6 +3237,9 @@ class ArrayAnalysis(object):
         ]
 
     def _gen_shape_call(self, equiv_set, var, ndims, shape, post):
+        if hasattr(self.func_ir, "array_analysis_run") and self.func_ir.array_analysis_run == True:
+            return None
+
         # attr call: A_sh_attr = getattr(A, shape)
         if isinstance(shape, ir.Var):
             shape = equiv_set.get_shape(shape)
