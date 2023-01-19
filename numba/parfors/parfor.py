@@ -126,7 +126,7 @@ class internal_prange(object):
         return range(*args)
 
 
-def min_parallel_impl(return_type, arg):
+def min_parallel_impl(typemap, return_type, arg, kws=None):
     # XXX: use prange for 1D arrays since pndindex returns a 1-tuple instead of
     # integer. This causes type and fusion issues.
     if arg.ndim == 0:
@@ -160,7 +160,7 @@ def min_parallel_impl(return_type, arg):
             return val
     return min_1
 
-def max_parallel_impl(return_type, arg):
+def max_parallel_impl(typemap, return_type, arg, kws=None):
     if arg.ndim == 0:
         def max_1(in_arr):
             return in_arr[()]
@@ -192,7 +192,7 @@ def max_parallel_impl(return_type, arg):
             return val
     return max_1
 
-def argmin_parallel_impl(in_arr):
+def argmin_parallel_impl(in_arr, kws=None):
     numba.parfors.parfor.init_prange()
     argmin_checker(len(in_arr))
     A = in_arr.ravel()
@@ -203,7 +203,7 @@ def argmin_parallel_impl(in_arr):
         ival = min(ival, curr_ival)
     return ival.index
 
-def argmax_parallel_impl(in_arr):
+def argmax_parallel_impl(in_arr, kws=None):
     numba.parfors.parfor.init_prange()
     argmax_checker(len(in_arr))
     A = in_arr.ravel()
@@ -214,7 +214,7 @@ def argmax_parallel_impl(in_arr):
         ival = max(ival, curr_ival)
     return ival.index
 
-def dotvv_parallel_impl(a, b):
+def dotvv_parallel_impl(a, b, typemap, kws=None):
     numba.parfors.parfor.init_prange()
     l = a.shape[0]
     m = b.shape[0]
@@ -225,7 +225,7 @@ def dotvv_parallel_impl(a, b):
         s += a[i] * b[i]
     return s
 
-def dotvm_parallel_impl(a, b):
+def dotvm_parallel_impl(a, b, typemap, kws=None):
     numba.parfors.parfor.init_prange()
     l = a.shape
     m, n = b.shape
@@ -242,7 +242,7 @@ def dotvm_parallel_impl(a, b):
         c += a[i] * b[i, :]
     return c
 
-def dotmv_parallel_impl(a, b):
+def dotmv_parallel_impl(a, b, typemap, kws=None):
     numba.parfors.parfor.init_prange()
     m, n = a.shape
     l = b.shape
@@ -256,7 +256,7 @@ def dotmv_parallel_impl(a, b):
         c[i] = s
     return c
 
-def dot_parallel_impl(return_type, atyp, btyp):
+def dot_parallel_impl(typemap, return_type, atyp, btyp, kws=None):
     # Note that matrix matrix multiply is not translated.
     if (isinstance(atyp, types.npytypes.Array) and
         isinstance(btyp, types.npytypes.Array)):
@@ -268,13 +268,13 @@ def dot_parallel_impl(return_type, atyp, btyp):
         elif atyp.ndim == 2 and btyp.ndim == 1:
             return dotmv_parallel_impl
 
-def sum_parallel_impl(return_type, arg):
-    zero = return_type(0)
-
+def sum_parallel_impl(typemap, return_type, arg, kws=None):
     if arg.ndim == 0:
         def sum_1(in_arr):
             return in_arr[()]
     elif arg.ndim == 1:
+        zero = return_type(0)
+
         def sum_1(in_arr):
             numba.parfors.parfor.init_prange()
             val = zero
@@ -282,15 +282,36 @@ def sum_parallel_impl(return_type, arg):
                 val += in_arr[i]
             return val
     else:
-        def sum_1(in_arr):
-            numba.parfors.parfor.init_prange()
-            val = zero
-            for i in numba.pndindex(in_arr.shape):
-                val += in_arr[i]
-            return val
+        kwsdict = dict(kws)
+        if "axis" in kwsdict:
+            axis_val = kwsdict["axis"]
+            axis_typ = typemap[axis_val.name]
+            if isinstance(axis_typ, types.Literal):
+                axis_val = axis_typ.literal_value
+                sum_1_def = f"""
+def sum_1(in_arr, axis=None):
+    numba.parfors.parfor.init_prange()
+    val = np.zeros(in_arr.shape[{axis_val}], dtype=in_arr.dtype)
+    for i in numba.parfors.parfor.internal_prange(in_arr.shape[{axis_val}]):
+        val += in_arr[""" + ",".join([":" if i != axis_val else "i" for i in range(arg.ndim)]) + """]
+    return val
+"""
+                locls = {}
+                exec(sum_1_def, globals(), locls)
+                return locls["sum_1"]
+            else:
+                return None
+        else:
+            zero = return_type(0)
+            def sum_1(in_arr):
+                numba.parfors.parfor.init_prange()
+                val = zero
+                for i in numba.pndindex(in_arr.shape):
+                    val += in_arr[i]
+                return val
     return sum_1
 
-def prod_parallel_impl(return_type, arg):
+def prod_parallel_impl(typemap, return_type, arg, kws=None):
     one = return_type(1)
 
     if arg.ndim == 0:
@@ -313,7 +334,7 @@ def prod_parallel_impl(return_type, arg):
     return prod_1
 
 
-def mean_parallel_impl(return_type, arg):
+def mean_parallel_impl(typemap, return_type, arg, kws=None):
     # can't reuse sum since output type is different
     zero = return_type(0)
 
@@ -336,7 +357,7 @@ def mean_parallel_impl(return_type, arg):
             return val/in_arr.size
     return mean_1
 
-def var_parallel_impl(return_type, arg):
+def var_parallel_impl(typemap, return_type, arg, kws=None):
     if arg.ndim == 0:
         def var_1(in_arr):
             return 0
@@ -364,12 +385,12 @@ def var_parallel_impl(return_type, arg):
             return ssd / in_arr.size
     return var_1
 
-def std_parallel_impl(return_type, arg):
+def std_parallel_impl(typemap, return_type, arg, kws=None):
     def std_1(in_arr):
         return in_arr.var() ** 0.5
     return std_1
 
-def arange_parallel_impl(return_type, *args):
+def arange_parallel_impl(typemap, return_type, *args, kws=None):
     dtype = as_dtype(return_type.dtype)
 
     def arange_1(stop):
@@ -414,7 +435,7 @@ def arange_parallel_impl(return_type, *args):
     else:
         raise ValueError("parallel arange with types {}".format(args))
 
-def linspace_parallel_impl(return_type, *args):
+def linspace_parallel_impl(typemap, return_type, *args, kws=None):
     dtype = as_dtype(return_type.dtype)
 
     def linspace_2(start, stop):
@@ -1477,9 +1498,12 @@ class PreParforPass(object):
                                     expr.args.insert(0, callname[1])
 
                             require(repl_func is not None)
-                            typs = tuple(self.typemap[x.name] for x in expr.args)
+                            reg_args = [self.typemap[x.name] for x in expr.args]
+                            kws_args = [self.typemap[x[1].name] for x in expr.kws]
+                            typs = tuple(reg_args + kws_args)
+                            #typs = tuple(self.typemap[x.name] for x in expr.args)
                             try:
-                                new_func =  repl_func(lhs_typ, *typs)
+                                new_func =  repl_func(self.typemap, lhs_typ, *(tuple(reg_args)), kws=expr.kws)
                             except:
                                 new_func = None
                             require(new_func is not None)
