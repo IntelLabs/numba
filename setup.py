@@ -398,6 +398,9 @@ metadata = dict(
     },
     scripts=["numba/pycc/pycc", "bin/numba"],
     url="https://numba.pydata.org",
+    project_urls={
+        "Source": "https://github.com/IntelLabs/numba",
+    },
     packages=packages,
     setup_requires=build_requires,
     install_requires=install_requires,
